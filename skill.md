@@ -28,7 +28,14 @@ python ~/.claude/skills/memory-lifecycle/scripts/install.py
 (On Windows: `python $env:USERPROFILE\.claude\skills\memory-lifecycle\scripts\install.py`)
 
 This creates `~/.claude/global/memory/`, adds `<!-- memory-index:start -->` / `<!-- memory-index:end -->`
-markers to CLAUDE.md, and registers a PostToolUse hook that auto-syncs on memory Write/Edit.
+markers to CLAUDE.md, and registers a `PostToolUse` hook:
+
+| Hook | Matcher | Purpose |
+|------|---------|---------|
+| `PostToolUse` | `Write\|Edit\|MultiEdit` + `pathPattern: **/.claude/**/memory/*.md` | Auto-sync after editing a memory file |
+
+This is **best effort** — the hook may not fire depending on harness, tool variant, or Claude Code version.
+Always follow the full lifecycle below: edit → sync → fix → verify. Do not assume the hook ran.
 
 Project-scope setup is automatic — the first `sync-memory` run inside a git project
 creates `~/.claude/projects/<project>/MEMORY.md` and the memory directory.
@@ -44,7 +51,11 @@ creates `~/.claude/projects/<project>/MEMORY.md` and the memory directory.
    ```
    One file covers all memories. Zero cost if nothing matches.
 
-## Writing a Memory
+## Full Lifecycle: Write/Edit → Sync → Fix → Verify
+
+### Step 1: Write or Edit the Memory File
+
+Create or edit a `.md` file in the memory directory with valid frontmatter:
 
 ```yaml
 ---
@@ -59,11 +70,74 @@ read-when:
 
 Body: any format. Recommended: `### entity-name — description` sections.
 
-After writing, run sync:
+**Use the dedicated file tools** — `Write` (new file / full overwrite), `Edit` (surgical string replacement),
+or `MultiEdit` (batch edits). Do NOT use shell commands (`Set-Content`, `Out-File`, `>>`) to write memory files —
+those bypass the tool matcher and the auto-sync hook won't fire.
+
+### Step 2: Run sync-memory
+
+After writing/editing, run sync to validate and rebuild the INDEX:
+
 ```
 python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py
 ```
-The PostToolUse hook runs this automatically on Write/Edit to any `**/.claude/**/memory/*.md` file.
+
+The `PostToolUse` hook does this automatically when you use `Write`, `Edit`, or `MultiEdit` on a
+`**/.claude/**/memory/*.md` file. But this is **best effort** — the hook may not fire depending on
+the harness, tool variant, or Claude Code version.
+
+**Do not assume it ran.** After editing a memory file, always verify Step 3.
+
+### Step 3: Check Sync Output for Errors and Warnings
+
+The sync output tells you exactly what happened:
+
+```
+INDEX.md written (7 memories)
+  synced: 7  |  stale: 0  |  needs-review: 0
+  errors: 0  |  warnings: 0
+```
+
+| Field | Meaning | Action |
+|-------|---------|--------|
+| `errors > 0` | Broken references, missing files, invalid frontmatter | Fix immediately — INDEX may be incomplete |
+| `warnings > 0` | Low-confidence links, deprecated patterns | Review and clean up |
+| `stale > 0` | Memories with `expires` in the past or `needs-review: true` | Update or remove |
+| `needs-review > 0` | Memories flagged for human review | Read and decide |
+
+If the INDEX timestamp hasn't changed after your edit, the hook didn't fire — run sync manually.
+
+### Step 4: Fix Issues and Re-sync
+
+If sync reported problems:
+
+1. Fix the memory files (broken refs, missing frontmatter, stale content)
+2. Run sync again
+3. Repeat until `errors: 0, warnings: 0`
+
+Use `--fix` to auto-remove broken references:
+
+```
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix
+```
+
+Use `--dry-run` first to preview what `--fix` would do:
+
+```
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix --dry-run
+```
+
+### Step 5: Verify INDEX is Current
+
+Check that the INDEX file was updated:
+
+```
+Get-ChildItem ~/.claude/global/memory/INDEX.md   # Windows
+ls -la ~/.claude/global/memory/INDEX.md           # Unix
+```
+
+The timestamp should be within seconds of your last edit. If it's not, the whole pipeline
+(edit → sync → fix → verify) didn't complete — go back to Step 2.
 
 ## Recalling a Memory
 

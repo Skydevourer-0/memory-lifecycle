@@ -1,29 +1,41 @@
+#!/usr/bin/env python3
 """
 memory-sync.py — Claude Code Memory Synchronization Script
 Core utilities: frontmatter parser, hashing, TTL management.
 """
+
+from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def safe_read_text(filepath: Path) -> str | None:
+    """Read a file as UTF-8, return None if encoding fails."""
+    try:
+        return filepath.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        print(f"Warning: cannot read {filepath} (not valid UTF-8), skipping", file=sys.stderr)
+        return None
+
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
 REQUIRED_FIELDS = {"name", "description"}
-VALID_TYPES = {"user", "feedback", "project", "reference"}
-VALID_CONFIDENCES = {"confirmed", "speculative", "deprecated"}
-CONFIDENCE_MAP = {"confirmed": 3, "speculative": 1, "deprecated": -5}
-TTL_PATTERN = re.compile(r"^(\d+)\s*([dmy])$", re.IGNORECASE)
-TTL_MULTIPLIER = {"d": 1, "m": 30, "y": 365}
 KEBAB_PATTERN = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 WIKI_LINK_PATTERN = re.compile(r"\[\[([a-z][a-z0-9-]*)\]\]")
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
-INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+?)`")
-FENCED_BLOCK_PATTERN = re.compile(r"```.*?```", re.DOTALL)
+
+# ── Hot-List Constants ──────────────────────────────────────────────────────────
+
+HOT_BUDGET = 2000
+MARKER_START = "<!-- memory-index:start -->"
+MARKER_END = "<!-- memory-index:end -->"
 
 # ── Frontmatter Parser ───────────────────────────────────────────────────────
 
@@ -114,6 +126,12 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
                 current_list = None
                 meta[key] = _parse_scalar(raw_val)
 
+    # Strip unknown fields — only keep v2 schema fields
+    KNOWN = {"name", "description", "references", "read_when"}
+    for key in list(meta.keys()):
+        if key not in KNOWN:
+            del meta[key]
+
     return meta, body
 
 
@@ -127,46 +145,8 @@ def file_hash(text: str) -> str:
     hash on the next run.  This also means frontmatter metadata changes (tags,
     description, etc.) are detected as changes, not just body changes.
     """
-    text_without_hash = re.sub(r'^\s*content_hash:.*\n?', '', text, flags=re.MULTILINE)
+    text_without_hash = re.sub(r'^\s*content_hash:.*\r?\n?', '', text, flags=re.MULTILINE)
     return hashlib.sha256(text_without_hash.encode("utf-8")).hexdigest()[:16]
-
-
-# ── TTL Utilities ────────────────────────────────────────────────────────────
-
-def parse_ttl(ttl_str: str | None) -> timedelta | None:
-    """Parse patterns like '90d', '6m', '1y' into timedelta.
-
-    Returns None when ttl_str is None or does not match the expected pattern.
-    """
-    if ttl_str is None:
-        return None
-    match = TTL_PATTERN.match(ttl_str.strip())
-    if not match:
-        return None
-    value = int(match.group(1))
-    unit = match.group(2).lower()
-    return timedelta(days=value * TTL_MULTIPLIER[unit])
-
-
-def is_expired(created_str: str | None, ttl_str: str | None) -> bool:
-    """Return True if the current time exceeds created + ttl.
-
-    Handles date-only ("2026-06-20") and full ISO-format strings.
-    Returns False when either argument is None or unparseable.
-    """
-    if created_str is None or ttl_str is None:
-        return False
-    ttl = parse_ttl(ttl_str)
-    if ttl is None:
-        return False
-    try:
-        created = datetime.fromisoformat(created_str)
-    except (ValueError, TypeError):
-        return False
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    return now > (created + ttl)
 
 
 # ── Path / Slug Utilities ───────────────────────────────────────────────────
@@ -194,80 +174,23 @@ def load_previous_index(index_json_path: Path) -> dict:
         return {"files": {}}
 
 
-# ── Helper: Days Since ────────────────────────────────────────────────────────
-
-def _days_since(date_str):
-    """Return days since given date string, or None if unparseable."""
-    if not date_str:
-        return None
-    try:
-        dt_str = str(date_str).replace("Z", "+00:00")
-        if "T" not in dt_str:
-            dt_str = dt_str + "T00:00:00+00:00"
-        dt = datetime.fromisoformat(dt_str)
-        return (datetime.now(timezone.utc) - dt).days
-    except (ValueError, TypeError):
-        return None
-
-
-# ── Inline Code Extraction ──────────────────────────────────────────────────
-
-def _extract_inline_terms(body: str) -> list[str]:
-    """Extract inline-code entities from body text.
-
-    Strips fenced code blocks first, then matches `...` patterns.
-    Filters out code blocks, pure non-ASCII terms, and terms >64 chars.
-    Deduplicates and returns a sorted list.
-    """
-    if not body:
-        return []
-    # Strip fenced code blocks
-    clean = FENCED_BLOCK_PATTERN.sub("", body)
-    matches = INLINE_CODE_PATTERN.findall(clean)
-    seen = set()
-    terms = []
-    for m in matches:
-        term = m.strip()
-        # Skip empty, too long, or single-character terms (noise)
-        if not term or len(term) > 64 or len(term) < 2:
-            continue
-        # Must contain at least one ASCII letter or digit
-        if not re.search(r'[A-Za-z0-9]', term):
-            continue
-        # Skip markdown headers copied into backticks
-        if term.startswith("#"):
-            continue
-        # Skip purely numeric terms
-        if re.match(r'^[0-9]+$', term):
-            continue
-        if term not in seen:
-            seen.add(term)
-            terms.append(term)
-    return sorted(terms, key=str.lower)
-
-
 # ── Validation Engine ─────────────────────────────────────────────────────────
 
-def validate(meta, body, stored_hash, known_slugs, in_degree, full_text=""):
-    """Perform deterministic validation checks on a memory record.
+def validate(meta: dict, body: str, stored_hash: str,
+             known_slugs: set, filepath: Path) -> tuple[list, str]:
+    """Run v2 validation — 4 checks.
 
     Returns (warnings_list, actual_hash).
     """
     warnings = []
-    actual_hash = file_hash(full_text) if full_text else file_hash(body)
+    full_text = safe_read_text(filepath) if filepath.exists() else ""
+    actual_hash = file_hash(full_text) if full_text else ""
 
     name = meta.get("name") if isinstance(meta.get("name"), str) else None
     description = meta.get("description") if isinstance(meta.get("description"), str) else None
-    meta_type = meta.get("metadata", {}).get("type") if isinstance(meta.get("metadata"), dict) else None
-    confidence = meta.get("confidence")
-    created = meta.get("created")
-    ttl = meta.get("ttl")
-    updated = meta.get("updated")
     references = meta.get("references", []) if isinstance(meta.get("references"), list) else []
-    context = meta.get("context", []) if isinstance(meta.get("context"), list) else []
-    tags = meta.get("tags", []) if isinstance(meta.get("tags"), list) else []
 
-    # 1. Missing required (error)
+    # Check 1: missing required
     if not name or not description:
         warnings.append({
             "level": "error",
@@ -276,164 +199,50 @@ def validate(meta, body, stored_hash, known_slugs, in_degree, full_text=""):
             "suggestion": "Add both name and description fields"
         })
 
-    # 2. Invalid name (error)
+    # Check 2: invalid name
     if name and not KEBAB_PATTERN.match(name):
         warnings.append({
             "level": "error",
             "check": "invalid-name",
-            "detail": "name '{0}' is not kebab-case".format(name),
+            "detail": f"name '{name}' is not kebab-case",
             "suggestion": "Use lowercase letters, digits, and hyphens only (e.g., 'my-memory')"
         })
 
-    # 3. Invalid metadata.type (error)
-    if meta_type is not None and meta_type not in VALID_TYPES:
-        warnings.append({
-            "level": "error",
-            "check": "invalid-type",
-            "detail": "metadata.type '{0}' is not valid".format(meta_type),
-            "suggestion": "Use one of: {0}".format(", ".join(sorted(VALID_TYPES)))
-        })
-
-    # 4. Stale hash (warning)
+    # Check 3: stale hash
     if stored_hash and stored_hash != actual_hash:
         warnings.append({
             "level": "warning",
             "check": "stale-hash",
             "detail": "stored hash does not match body hash",
-            "suggestion": "Update the content_hash field in the index"
+            "suggestion": "Hash auto-updated in INDEX.json on next write"
         })
 
-    # 5. TTL expired (warning)
-    if is_expired(created, ttl):
-        warnings.append({
-            "level": "warning",
-            "check": "ttl-expired",
-            "detail": "memory has expired (created={0}, ttl={1})".format(created, ttl),
-            "suggestion": "Review and update the memory or extend its TTL"
-        })
-
-    # 6. Broken references (error)
-    body_links = WIKI_LINK_PATTERN.findall(body) if body else []
-    ref_slugs = body_links + references
-    broken = [slug for slug in ref_slugs if slug not in known_slugs]
+    # Check 4: broken references
+    broken = [r for r in references if r not in known_slugs]
     if broken:
         warnings.append({
             "level": "error",
             "check": "broken-references",
-            "detail": "references to unknown slugs: {0}".format(broken),
-            "suggestion": "Create memories for: {0}".format(", ".join(broken))
+            "detail": f"references to unknown slugs: {broken}",
+            "suggestion": f"Remove broken references: {', '.join(broken)}"
         })
 
-    # 7. Orphan confirmed (warning)
-    if confidence == "confirmed" and in_degree == 0:
-        days = _days_since(updated)
-        if days is not None and days > 180:
-            warnings.append({
-                "level": "warning",
-                "check": "orphan-confirmed",
-                "detail": "confirmed memory with no incoming references, last updated {0} days ago (>180)".format(days),
-                "suggestion": "Consider deprecating or linking this memory to others"
-            })
-
-    # 8. Upgradable speculative (info)
-    if confidence == "speculative" and in_degree >= 3:
-        warnings.append({
-            "level": "info",
-            "check": "upgradable-speculative",
-            "detail": "speculative memory has {0} incoming references (>=3)".format(in_degree),
-            "suggestion": "Consider upgrading confidence to 'confirmed'"
-        })
-
-    # 9. Missing context (info)
-    if not context:
-        warnings.append({
-            "level": "info",
-            "check": "missing-context",
-            "detail": "context array is empty or missing",
-            "suggestion": "Add related memory slugs to the context field"
-        })
-
-    # 10. Empty tags (info)
-    if not tags:
-        warnings.append({
-            "level": "info",
-            "check": "empty-tags",
-            "detail": "tags array is empty or missing",
-            "suggestion": "Add relevant tags for discoverability"
-        })
-
-    # 11. Body headings not reflected in tags (warning)
-    # Extract heading terms — named entities (commands, functions, components)
-    # that should be discoverable via tag-based recall. Kebab-case filter
-    # excludes noise (Chinese headings, generic prose).
-    headings = HEADING_PATTERN.findall(body) if body else []
-    heading_terms = []
-    for level_str, heading_text in headings:
-        # Only entity-style headings with separators (e.g., "### ndd — quick editor").
-        # Plain labels like "Problem" or "Why" are section markers, not entities.
-        if not re.search(r'[—:–]', heading_text):
-            continue
-        # Extract the first term before any separator (em-dash, en-dash, colon)
-        # NOTE: hyphen (-) is NOT a separator — it is part of kebab-case names
-        term = re.split(r'\s*[—:–]\s*', heading_text.strip())[0].strip()
-        # Only flag if it looks like a taggable keyword (lowercase ascii,
-        # alphanumeric with hyphens, no spaces)
-        if term and re.match(r'^[a-z][a-z0-9-]*$', term.lower()):
-            heading_terms.append(term.lower())
-
-    tags_lower = [t.lower() for t in tags]
-    missing_from_tags = [t for t in heading_terms if t not in tags_lower]
-    if missing_from_tags:
+    # Check 5: weak or empty read-when
+    rw = meta.get("read_when", []) or []
+    if not rw:
         warnings.append({
             "level": "warning",
-            "check": "heading-not-in-tags",
-            "detail": "body headings found that are missing from metadata.tags: {0}".format(missing_from_tags),
-            "suggestion": "Add these terms to the tags field so they are discoverable by the recall system: {0}".format(", ".join(missing_from_tags))
+            "check": "empty-read-when",
+            "detail": "read-when is empty — WARM recall will never find this memory",
+            "suggestion": "Add 2-3 natural-language phrases describing when this memory is useful"
         })
-
-    # 12. Inline code terms missing from context (info)
-    inline_terms = _extract_inline_terms(body)
-    context_lower = [str(c).lower() for c in context if c]
-    missing_context = [t for t in inline_terms if t.lower() not in context_lower]
-    if missing_context:
+    elif all(len(p.strip()) < 10 for p in rw):
         warnings.append({
-            "level": "info",
-            "check": "inline-code-not-in-context",
-            "detail": "inline `code` entities found that are missing from metadata.context: {0}".format(missing_context),
-            "suggestion": "Add these terms to the context field for extended discoverability: {0}".format(", ".join(missing_context))
+            "level": "warning",
+            "check": "weak-read-when",
+            "detail": "all read-when phrases are very short (<10 chars), may match too broadly",
+            "suggestion": "Use longer, more specific phrases like 'debugging tt statusline cost display'"
         })
-
-    # 13. Feedback/project memories missing required structure (info)
-    # Per memory spec: type: feedback and type: project must include
-    # **Why:** and **How to apply:** sections in the body.
-    if meta_type in ("feedback", "project"):
-        missing_sections = []
-        if "**Why:**" not in body and "**Why: **" not in body:
-            missing_sections.append("Why")
-        if "**How to apply:**" not in body and "**How to apply: **" not in body:
-            missing_sections.append("How to apply")
-        if missing_sections:
-            warnings.append({
-                "level": "info",
-                "check": "feedback-missing-structure",
-                "detail": "type: {0} memory is missing required sections: {1}".format(
-                    meta_type, ", ".join(missing_sections)),
-                "suggestion": "Add **Why:** and **How to apply:** sections to the body. This is a semantic requirement — the script cannot fix it automatically.",
-            })
-
-    # 14. Reference memories without entity-style headings (info)
-    # Entity headings ("### ndd — description") enable automatic tag extraction.
-    # Memories with only section labels ("## Overview") produce no taggable terms.
-    if meta_type == "reference":
-        headings = HEADING_PATTERN.findall(body) if body else []
-        has_entity = any(re.search(r'[—:–]', h[1]) for h in headings)
-        if not has_entity:
-            warnings.append({
-                "level": "info",
-                "check": "reference-missing-entity-headings",
-                "detail": "No entity-style headings found (e.g., '### name — description'). Section labels like '## Overview' are not taggable by check #11.",
-                "suggestion": "Add at least one entity heading with a separator (—, :, or –) so key terms can be automatically extracted as tags.",
-            })
 
     return warnings, actual_hash
 
@@ -459,7 +268,7 @@ def build_graph(records):
         seen = set()
         combined = []
         for slug_ref in body_links + references:
-            if slug_ref not in seen:
+            if slug_ref != slug and slug_ref not in seen:
                 seen.add(slug_ref)
                 combined.append(slug_ref)
 
@@ -488,184 +297,188 @@ def compute_degrees(graph):
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
-def compute_score(meta, in_deg, out_deg):
-    """Compute a memory score per spec section 4.
+def compute_score(meta: dict, in_deg: int, out_deg: int, last_hit: str | None = None) -> float:
+    """Compute v2 score: graph degree + freshness bonus + hit bonus.
 
-    score = priority + in_deg * 2.0 + out_deg * 0.5 + confidence_map + max(0, 10 - days_since_updated)
-    Rounded to 1 decimal place.
+    score = in_degree * 2.0 + out_degree * 0.5 + max(0, 10 - days_since_mtime) + (5.0 if hit within 30 days else 0)
     """
-    # Priority: try int conversion, default 3
-    priority_raw = meta.get("priority", 3)
-    try:
-        priority = int(priority_raw)
-    except (ValueError, TypeError):
-        priority = 3
-
-    # Confidence map value
-    confidence = meta.get("confidence", "speculative")
-    confidence_val = CONFIDENCE_MAP.get(confidence, 1)
-
-    # Days since updated
-    updated = meta.get("updated")
-    days = _days_since(updated)
-    if days is None:
-        days = 0
-    days_bonus = max(0, 10 - days)
-
-    score = priority + in_deg * 2.0 + out_deg * 0.5 + confidence_val + days_bonus
+    days = 0
+    filepath = meta.get("_filepath")
+    if filepath and filepath.exists():
+        mtime = filepath.stat().st_mtime
+        days = (datetime.now(timezone.utc).timestamp() - mtime) / 86400
+    days_bonus = max(0.0, 10.0 - days)
+    hit_bonus = 0.0
+    if last_hit:
+        try:
+            hit_dt = datetime.fromisoformat(last_hit)
+            if (datetime.now(timezone.utc) - hit_dt).days < 30:
+                hit_bonus = 5.0
+        except (ValueError, TypeError):
+            pass
+    score = in_deg * 2.0 + out_deg * 0.5 + days_bonus + hit_bonus
     return round(score, 1)
 
-
-def score_tier(score):
-    """Return the tier label for a given score."""
-    if score >= 12:
-        return "high"
-    elif score >= 5:
-        return "normal"
-    else:
-        return "low"
 
 
 # ── INDEX.md Generator ────────────────────────────────────────────────────────
 
-def build_index_md(records, warnings, scores, in_deg, out_deg, memory_dir):
-    """Generate INDEX.md content from records and analysis data.
-
-    Returns a markdown string with memories grouped by tier and warnings.
-    """
+def build_index_md(records: list, warnings: list, scores: dict,
+                   in_deg: dict, out_deg: dict) -> str:
+    """Generate v2 INDEX.md — flat list sorted by score descending."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = []
-    lines.append("# Memory Index")
-    lines.append(f"*{now_str} · {len(records)} memories · {len(warnings)} warnings*")
-    lines.append("")
-
-    # Group records by tier
-    tier_records = {"high": [], "normal": [], "low": []}
-    for record in records:
-        slug = record["slug"]
-        score = scores.get(slug, 0)
-        tier = score_tier(score)
-        tier_records[tier].append((score, record))
-
-    # Sort each tier by score descending
-    for tier in tier_records:
-        tier_records[tier].sort(key=lambda x: x[0], reverse=True)
-
-    # Tier display metadata
-    tier_config = [
-        ("high", "## R Priority (score >= 12)", "*Always load*"),
-        ("normal", "## Y Normal (score 5–11)", "*Context-match*"),
-        ("low", "## G Low (score < 5)", "*Exact-match only*"),
+    lines = [
+        "# Memory Index",
+        f"*{now_str} · {len(records)} memories*",
+        "",
     ]
 
-    for tier_key, heading, subtitle in tier_config:
-        entries = tier_records[tier_key]
-        if not entries:
-            continue
-        lines.append(heading)
-        lines.append(subtitle)
-        for score, record in entries:
-            slug = record["slug"]
-            meta = record.get("metadata", {})
-            description = meta.get("description", "")
-            updated = meta.get("updated", "")
-            in_d = in_deg.get(slug, 0)
-            out_d = out_deg.get(slug, 0)
-            lines.append(f"- [{slug}]({slug}.md) — {description}  score:{score}  updated:{updated}  in:{in_d} out:{out_d}")
+    # Sort by score descending
+    sorted_records = sorted(
+        records, key=lambda r: scores.get(r["slug"], 0), reverse=True
+    )
+
+    for record in sorted_records:
+        slug = record["slug"]
+        meta = record.get("metadata", {})
+        desc = meta.get("description", "")
+        score = scores.get(slug, 0)
+        in_d = in_deg.get(slug, 0)
+        out_d = out_deg.get(slug, 0)
+
+        # updated from stored _updated_str (set before writeback pops _filepath)
+        updated_str = record.get("_updated_str", "")
+
+        # read-when condensed
+        rw = meta.get("read_when", []) or []
+        rw_str = ", ".join(rw) if rw else "(none)"
+
+        lines.append(f"- [{slug}]({slug}.md) — {desc}")
+        lines.append(f"  read-when: {rw_str}")
+        lines.append(f"  updated: {updated_str} · refs: in {in_d}, out {out_d} · score: {score}")
         lines.append("")
 
     # Warnings section
     if warnings:
         lines.append("## Warnings")
         lines.append("")
-
-        level_order = {"error": 0, "warning": 1, "info": 2}
-        level_prefix = {"error": "ERR", "warning": "WARN", "info": "INFO"}
-        sorted_warnings = sorted(warnings, key=lambda w: level_order.get(w.get("level", "info"), 3))
-
-        for w in sorted_warnings:
-            level = w.get("level", "info")
-            prefix = level_prefix.get(level, level.upper())
+        for w in sorted(warnings, key=lambda w: {"error": 0, "warning": 1}.get(w.get("level", "info"), 2)):
             check = w.get("check", "")
             detail = w.get("detail", "")
             suggestion = w.get("suggestion", "")
-            lines.append(f"- **{prefix}** [{check}] {detail}")
+            lines.append(f"- **{'ERR' if w.get('level') == 'error' else 'WARN'}** [{check}] {detail}")
             lines.append(f"  → {suggestion}")
-
         lines.append("")
 
     return "\n".join(lines)
 
 
+# ── Hot-List Injection ──────────────────────────────────────────────────────────
+
+
+def inject_hot_list(records: list, scores: dict, target_file: Path,
+                    scope_label: str = "global") -> None:
+    """Write Top-N entries into CLAUDE.md or MEMORY.md between markers.
+
+    Auto-creates the target file and markers if they don't exist.
+    """
+    if target_file.exists():
+        content = safe_read_text(target_file) or ""
+    else:
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        content = ""
+
+    if MARKER_START not in content or MARKER_END not in content:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += f"{MARKER_START}\n{MARKER_END}\n"
+
+    # Build hot list entries with scope-aware relative paths
+    sorted_records = sorted(
+        records, key=lambda r: scores.get(r["slug"], 0), reverse=True
+    )
+
+    if scope_label == "global":
+        path_prefix = "global/memory"
+    else:
+        path_prefix = f"projects/{scope_label}/memory"
+
+    entries = []
+    budget_remaining = HOT_BUDGET
+    for record in sorted_records:
+        slug = record["slug"]
+        desc = record.get("metadata", {}).get("description", "")
+        entry = f"- [{slug}]({path_prefix}/{slug}.md) — {desc}"
+        if len(entry) <= budget_remaining:
+            entries.append(entry)
+            budget_remaining -= len(entry) + 1
+        else:
+            break
+
+    new_block = f"{MARKER_START}\n{chr(10).join(entries)}{chr(10) if entries else ''}{MARKER_END}"
+
+    start = content.find(MARKER_START)
+    end = content.find(MARKER_END) + len(MARKER_END)
+    new_content = content[:start] + new_block + content[end:]
+
+    target_file.write_text(new_content, encoding="utf-8")
+
+
 # ── INDEX.json Generator ──────────────────────────────────────────────────────
 
-def build_index_json(project_name, memory_dir, records, warnings, scores, in_deg, out_deg, graph):
-    """Generate INDEX.json content from records and analysis data.
-
-    Returns a JSON string with memory metadata, warnings, and citation graph.
-    """
+def build_index_json(project_name: str, memory_dir: Path, records: list,
+                     warnings: list, scores: dict, in_deg: dict,
+                     out_deg: dict, graph: dict, prev_index: dict | None = None) -> str:
+    """Generate INDEX.json from v2 records."""
+    prev_files = (prev_index or {}).get("files", {})
     files = {}
     for record in records:
         slug = record["slug"]
         meta = record.get("metadata", {})
-        files[slug] = {
+        prev_entry = prev_files.get(slug, {})
+        entry = {
             "path": f"memory/{slug}.md",
             "hash": record.get("stored_hash", ""),
             "name": meta.get("name", ""),
             "description": meta.get("description", ""),
-            "metadata_type": meta.get("metadata", {}).get("type", ""),
-            "tags": meta.get("tags", []),
-            "context": meta.get("context", []),
             "references": meta.get("references", []),
-            "confidence": meta.get("confidence", ""),
-            "priority": meta.get("priority", 0),
-            "ttl": meta.get("ttl", ""),
-            "created": meta.get("created", ""),
-            "updated": meta.get("updated", ""),
+            "read_when": meta.get("read_when", []),
             "in_degree": in_deg.get(slug, 0),
             "out_degree": out_deg.get(slug, 0),
             "score": scores.get(slug, 0),
-            "skill": (record.get("metadata", {}).get("metadata") or {}).get("skill", ""),
             "sync_status": record.get("sync_status", ""),
         }
-
-    # Filter graph to only include targets that exist as keys
+        # Preserve hit tracking fields from previous index
+        if "hit_count" in prev_entry:
+            entry["hit_count"] = prev_entry.get("hit_count", 0)
+        if "last_hit" in prev_entry:
+            entry["last_hit"] = prev_entry.get("last_hit")
+        files[slug] = entry
     existing_slugs = {record["slug"] for record in records}
-    filtered_graph = {}
-    for slug, refs in graph.items():
-        filtered_refs = [ref for ref in refs if ref in existing_slugs]
-        filtered_graph[slug] = filtered_refs
-
-    result = {
+    filtered_graph = {
+        slug: [r for r in refs if r in existing_slugs]
+        for slug, refs in graph.items()
+    }
+    return json.dumps({
         "project": project_name,
         "memory_dir": str(memory_dir),
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "files": files,
         "warnings": warnings,
         "graph": filtered_graph,
-    }
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    }, indent=2, ensure_ascii=False)
 
 
 # ── Memory Directory Scanner ──────────────────────────────────────────────────
 
-def _prev_to_meta(prev_entry):
-    """Convert a flat INDEX.json file entry back to nested metadata format."""
-    meta = {
+def _prev_to_meta(prev_entry: dict) -> dict:
+    """Convert a flat INDEX.json entry back to v2 metadata format."""
+    return {
         "name": prev_entry.get("name", ""),
         "description": prev_entry.get("description", ""),
-        "tags": prev_entry.get("tags", []),
-        "context": prev_entry.get("context", []),
         "references": prev_entry.get("references", []),
-        "confidence": prev_entry.get("confidence", "speculative"),
-        "priority": prev_entry.get("priority", 3),
-        "ttl": prev_entry.get("ttl"),
-        "created": prev_entry.get("created"),
-        "updated": prev_entry.get("updated"),
+        "read_when": prev_entry.get("read_when", []),
     }
-    meta["metadata"] = {"type": prev_entry.get("metadata_type", "")}
-    return meta
 
 
 def scan_memory_dir(memory_dir, prev_index, target_files=None):
@@ -716,7 +529,9 @@ def scan_memory_dir(memory_dir, prev_index, target_files=None):
         if slug not in path_map:
             path_map[slug] = fp
         slug = slug_from_path(fp)
-        text = fp.read_text(encoding="utf-8")
+        text = safe_read_text(fp)
+        if text is None:
+            continue
 
         # Extract body for validation (hash uses full text below)
         if text.startswith("---"):
@@ -760,7 +575,9 @@ def scan_memory_dir(memory_dir, prev_index, target_files=None):
         if slug not in parsed:
             af_file = memory_dir / f"{slug}.md"
             if af_file.exists():
-                text = af_file.read_text(encoding="utf-8")
+                text = safe_read_text(af_file)
+                if text is None:
+                    continue
                 if text.startswith("---"):
                     end = text.find("---", 3)
                     body = text[end + 3:].strip() if end != -1 else text.strip()
@@ -795,167 +612,26 @@ def scan_memory_dir(memory_dir, prev_index, target_files=None):
 # ── Writeback ─────────────────────────────────────────────────────────────────
 
 def writeback_content_hash(records, memory_dir):
-    """Write updated content_hash values back into memory files.
+    """Update stored_hash on records and clean up temp keys.
 
-    Only modifies the content_hash line in frontmatter; all other content
-    is left untouched.  Sets record['stored_hash'] and cleans up temp keys.
+    v2: content_hash lives only in INDEX.json. This function does NOT
+    modify .md files — the hash is a derived cache, not source of truth.
     """
     for record in records:
         actual_hash = record.get("_actual_hash")
-        filepath = record.get("_filepath")
-        if not actual_hash or not filepath:
-            continue
-
-        content = filepath.read_text(encoding="utf-8")
-
-        if content.startswith("---"):
-            end_idx = content.find("---", 3)
-            if end_idx == -1:
-                # Malformed frontmatter — skip writeback for this file
-                record["stored_hash"] = actual_hash
-                record.pop("_actual_hash", None)
-                record.pop("_filepath", None)
-                continue
-
-            frontmatter = content[3:end_idx]
-            rest = content[end_idx:]
-
-            if re.search(r"^\s*content_hash:", frontmatter, re.MULTILINE):
-                # Replace existing hash value (preserving original indentation)
-                new_frontmatter = re.sub(
-                    r"^(\s*)content_hash:\s*\S*",
-                    r"\1content_hash: {0}".format(actual_hash),
-                    frontmatter,
-                    flags=re.MULTILINE,
-                )
-                new_content = "---" + new_frontmatter + rest
-            else:
-                # Insert before closing ---
-                new_content = content[:end_idx] + f"content_hash: {actual_hash}\n" + content[end_idx:]
-        else:
-            # No frontmatter — nothing to write
-            new_content = content
-
-        filepath.write_text(new_content, encoding="utf-8")
-        record["stored_hash"] = actual_hash
+        if actual_hash:
+            record["stored_hash"] = actual_hash
         record.pop("_actual_hash", None)
         record.pop("_filepath", None)
 
 
 # ── Fix Engine ────────────────────────────────────────────────────────────────
 
-def _tag_insert_positions(lines):
-    """Return (tags_key_idx, first_item_idx, last_item_idx, indent, item_prefix).
-
-    tags_key_idx:  the line ending with 'tags:'
-    first_item_idx: first indented '- tag' line, or -1 if no tags exist
-    last_item_idx:  last indented '- tag' line, or -1
-    indent:         whitespace prefix of the 'tags:' line
-    item_prefix:    whitespace before '- tag' items (indent + 4 spaces)
-    """
-    tags_key_idx = -1
-    first_item_idx = -1
-    last_item_idx = -1
-    indent = ""
-    item_prefix = ""
-
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-        if tags_key_idx < 0 and stripped.endswith("tags:"):
-            tags_key_idx = i
-            indent = line[: len(line) - len(line.lstrip())]
-            item_prefix = indent + "  "
-        elif tags_key_idx >= 0:
-            if line.startswith(item_prefix) and line.lstrip().startswith("- "):
-                if first_item_idx < 0:
-                    first_item_idx = i
-                last_item_idx = i
-            elif line.startswith(indent) and not line.lstrip().startswith("- "):
-                # Reached next same-indent key — end of tags block
-                break
-
-    return tags_key_idx, first_item_idx, last_item_idx, indent, item_prefix
-
-
-def _fix_tags_on_disk(filepath, tags_to_add):
-    """Append new tags to the frontmatter tags block."""
-    text = filepath.read_text(encoding="utf-8")
-    lines = text.split("\n")
-
-    tags_key_idx, first_item_idx, last_item_idx, indent, item_prefix = (
-        _tag_insert_positions(lines)
-    )
-
-    if tags_key_idx < 0:
-        return  # no tags: key — shouldn't happen for valid files
-
-    new_lines = [f"{item_prefix}- {t}" for t in tags_to_add]
-
-    if last_item_idx >= 0:
-        # Insert after last existing tag
-        for i, nl in enumerate(new_lines):
-            lines.insert(last_item_idx + 1 + i, nl)
-    else:
-        # No tags yet — insert after tags: line
-        for i, nl in enumerate(new_lines):
-            lines.insert(tags_key_idx + 1 + i, nl)
-
-    filepath.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _fix_context_on_disk(filepath, items_to_add):
-    """Append items to the frontmatter context block."""
-    text = filepath.read_text(encoding="utf-8")
-    lines = text.split("\n")
-
-    # Reuse tag insertion logic — context has identical YAML block structure
-    ctx_key_idx = -1
-    first_item_idx = -1
-    last_item_idx = -1
-    indent = ""
-    item_prefix = ""
-
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-        if ctx_key_idx < 0 and stripped.endswith("context:"):
-            ctx_key_idx = i
-            indent = line[: len(line) - len(line.lstrip())]
-            item_prefix = indent + "  "
-        elif ctx_key_idx >= 0:
-            if line.startswith(item_prefix) and line.lstrip().startswith("- "):
-                if first_item_idx < 0:
-                    first_item_idx = i
-                last_item_idx = i
-            elif line.startswith(indent) and not line.lstrip().startswith("- "):
-                break
-
-    if ctx_key_idx < 0:
-        return
-
-    # Quote values that would break YAML parsing (contain ", [, ], :, #, etc.)
-    yaml_safe = []
-    for t in items_to_add:
-        if re.search(r'["\[\]{}:#]', t):
-            escaped = t.replace('"', '\\"')
-            yaml_safe.append(f'"{escaped}"')
-        else:
-            yaml_safe.append(t)
-
-    new_lines = [f"{item_prefix}- {v}" for v in yaml_safe]
-
-    if last_item_idx >= 0:
-        for i, nl in enumerate(new_lines):
-            lines.insert(last_item_idx + 1 + i, nl)
-    else:
-        for i, nl in enumerate(new_lines):
-            lines.insert(ctx_key_idx + 1 + i, nl)
-
-    filepath.write_text("\n".join(lines), encoding="utf-8")
-
-
 def _fix_references_on_disk(filepath, new_refs):
     """Replace the frontmatter references list with new_refs."""
-    text = filepath.read_text(encoding="utf-8")
+    text = safe_read_text(filepath)
+    if text is None:
+        return
     lines = text.split("\n")
 
     # Locate the references block
@@ -1006,92 +682,25 @@ def _fix_references_on_disk(filepath, new_refs):
     filepath.write_text("\n".join(lines), encoding="utf-8")
 
 
-def apply_fixes(records, known_slugs, memory_dir, dry_run=False):
-    """Apply automatic fixes for fixable warnings.
-
-    Returns a list of fix descriptions applied.
-    """
+def apply_fixes(records: list, known_slugs: set, memory_dir: Path,
+                dry_run: bool = False) -> list:
+    """Apply v2 fixes — only remove broken references."""
     fixes = []
-
     for record in records:
         slug = record["slug"]
-        filepath = record.get("_filepath")
-        if not filepath:
-            continue
-
         meta = record.get("metadata", {})
-        body = record.get("body", "")
-        tags = meta.get("tags") or []
         references = meta.get("references") or []
-
-        # Fix 1: Remove broken references
         broken = [r for r in references if r not in known_slugs]
         if broken:
             new_refs = [r for r in references if r not in broken]
             fixes.append({
                 "slug": slug,
                 "check": "broken-references",
-                "detail": "Removed broken references: {0}".format(broken),
+                "detail": f"Removed broken references: {broken}",
             })
             if not dry_run:
-                _fix_references_on_disk(filepath, new_refs)
-            record["metadata"]["references"] = new_refs
-
-        # Fix 2: Add heading terms to tags
-        headings = HEADING_PATTERN.findall(body) if body else []
-        heading_terms = []
-        for _level_str, heading_text in headings:
-            if not re.search(r'[—:–]', heading_text):
-                continue
-            term = re.split(r'\s*[—:–]\s*', heading_text.strip())[0].strip()
-            if term and re.match(r'^[a-z][a-z0-9-]*$', term.lower()):
-                heading_terms.append(term.lower())
-
-        tags_lower = [t.lower() for t in tags]
-        missing = [t for t in heading_terms if t not in tags_lower]
-        if missing:
-            fixes.append({
-                "slug": slug,
-                "check": "heading-not-in-tags",
-                "detail": "Added to tags: {0}".format(missing),
-            })
-            if not dry_run:
-                _fix_tags_on_disk(filepath, missing)
-            record["metadata"]["tags"] = tags + missing
-
-        # Fix 3: Add inline code entities to context
-        inline_terms = _extract_inline_terms(body)
-        context_lower = [str(c).lower() for c in (meta.get("context") or []) if c]
-        missing_context = [t for t in inline_terms if t.lower() not in context_lower]
-        if missing_context:
-            new_context = (meta.get("context") or []) + missing_context
-            fixes.append({
-                "slug": slug,
-                "check": "inline-code-not-in-context",
-                "detail": "Added to context: {0}".format(missing_context),
-            })
-            if not dry_run:
-                _fix_context_on_disk(filepath, missing_context)
-            record["metadata"]["context"] = new_context
-
-        # Fix 4: Add body wiki-links to references when target exists
-        body_links = WIKI_LINK_PATTERN.findall(body) if body else []
-        existing_refs = set(references)
-        new_ref_links = [
-            l for l in body_links
-            if l in known_slugs and l != slug and l not in existing_refs
-        ]
-        if new_ref_links:
-            new_refs = references + new_ref_links
-            fixes.append({
-                "slug": slug,
-                "check": "wiki-link-not-in-references",
-                "detail": "Added body wiki-links to references: {0}".format(new_ref_links),
-            })
-            if not dry_run:
-                _fix_references_on_disk(filepath, new_refs)
-            record["metadata"]["references"] = new_refs
-
+                _fix_references_on_disk(memory_dir / f"{slug}.md", new_refs)
+                record["metadata"]["references"] = new_refs
     return fixes
 
 
@@ -1116,12 +725,10 @@ def audit_candidates(records):
     Returns list of candidate dicts with keys:
     a, b, shared_tags, shared_headings, updated_a, updated_b, suggestion
     """
-    # Only knowledge memories
+    # v2: all memories are knowledge memories; type field removed
     knowledge = []
     for r in records:
-        mt = (r.get("metadata", {}).get("metadata") or {}).get("type")
-        if mt != "task":
-            knowledge.append(r)
+        knowledge.append(r)
 
     candidates = []
     for i in range(len(knowledge)):
@@ -1132,11 +739,11 @@ def audit_candidates(records):
             meta_a = a.get("metadata", {})
             meta_b = b.get("metadata", {})
 
-            tags_a = set(t.lower() for t in (meta_a.get("tags") or []) if t)
-            tags_b = set(t.lower() for t in (meta_b.get("tags") or []) if t)
-            shared_tags = sorted(tags_a & tags_b)
-
-            if len(shared_tags) < 2:
+            # v2: use shared references instead of removed tags field
+            refs_a = set(r.lower() for r in (meta_a.get("references") or []) if r)
+            refs_b = set(r.lower() for r in (meta_b.get("references") or []) if r)
+            shared_refs = sorted(refs_a & refs_b)
+            if len(shared_refs) < 1:
                 continue
 
             headings_a = _extract_heading_terms(a.get("body", ""))
@@ -1149,7 +756,7 @@ def audit_candidates(records):
             candidates.append({
                 "a": a["slug"],
                 "b": b["slug"],
-                "shared_tags": shared_tags,
+                "shared_refs": shared_refs,
                 "shared_headings": shared_headings,
                 "updated_a": meta_a.get("updated", ""),
                 "updated_b": meta_b.get("updated", ""),
@@ -1160,187 +767,248 @@ def audit_candidates(records):
     return candidates
 
 
+# ── Hit Tracking ──────────────────────────────────────────────────────────────
+
+
+def _get_all_memory_dirs() -> list[tuple[Path, str]]:
+    """Return all (memory_dir, scope_label) tuples."""
+    dirs = []
+    home = Path.home().resolve()
+    global_dir = home / ".claude" / "global" / "memory"
+    if global_dir.exists():
+        dirs.append((global_dir, "global"))
+    projects_base = home / ".claude" / "projects"
+    if projects_base.exists():
+        for proj_dir in sorted(projects_base.iterdir()):
+            mem_dir = proj_dir / "memory"
+            if mem_dir.is_dir():
+                dirs.append((mem_dir, proj_dir.name))
+    return dirs
+
+
+def record_hit(slug: str) -> None:
+    """Increment hit_count and set last_hit for a memory in its INDEX.json."""
+    home = Path.home().resolve()
+    # Search all scopes for this slug
+    for memory_dir, _ in _get_all_memory_dirs():
+        index_path = memory_dir / "INDEX.json"
+        if not index_path.exists():
+            continue
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        entry = data.get("files", {}).get(slug)
+        if entry:
+            entry["hit_count"] = entry.get("hit_count", 0) + 1
+            entry["last_hit"] = datetime.now(timezone.utc).isoformat()
+            index_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            return
+    print(f"Memory not found: {slug}", file=sys.stderr)
+
+
+# ── Read-When Hints ─────────────────────────────────────────────────────────
+
+
+def suggest_read_when(body: str) -> list[str]:
+    """Extract heading terms that could serve as read-when phrases."""
+    headings = HEADING_PATTERN.findall(body) if body else []
+    suggestions = []
+    for _, heading_text in headings:
+        clean = heading_text.strip()
+        if 10 <= len(clean) <= 80:
+            suggestions.append(clean)
+    return suggestions[:5]
+
+
+# ── Scope Detection ───────────────────────────────────────────────────────────
+
+
+def _slugify(name: str) -> str:
+    """Sanitize a directory name to kebab-case for use as a project slug."""
+    name = name.lower()
+    # Collapse runs of hyphens
+    name = re.sub(r'[-]+', '-', name)
+    # Replace any non-alphanumeric (except hyphen) with hyphen
+    name = re.sub(r'[^a-z0-9-]', '-', name)
+    # Strip leading/trailing hyphens
+    return name.strip('-')
+
+
+def detect_scope(cwd=None, scope_from_file=None):
+    """Detect memory directory and scope label.
+
+    Returns (memory_dir, scope_label) where scope_label is 'global' or 'project'.
+    - Global:  ~/.claude/global/memory/
+    - Project: ~/.claude/projects/<project-slug>/memory/
+    """
+    if scope_from_file:
+        fp = Path(scope_from_file).resolve()
+        home = Path.home().resolve()
+        fp_str = str(fp).replace("\\", "/")
+        home_str = str(home).replace("\\", "/").rstrip("/") + "/"
+        if fp_str.startswith(home_str + ".claude/global/memory/"):
+            return home / ".claude" / "global" / "memory", "global"
+        # Check if under ~/.claude/projects/<slug>/memory/
+        m = re.match(r'.*\.claude/projects/([^/]+)/memory/.*', fp_str)
+        if m:
+            return home / ".claude" / "projects" / m.group(1) / "memory", m.group(1)
+        # Fallback: walk up from file
+        return _find_project_memory(fp.parent), "project"
+
+    # Auto-detect from CWD
+    cwd = cwd or Path.cwd()
+    for parent in [cwd] + list(cwd.parents):
+        if (parent / ".git").exists():
+            slug = _slugify(parent.name)
+            return Path.home() / ".claude" / "projects" / slug / "memory", slug
+    return Path.home() / ".claude" / "global" / "memory", "global"
+
+
+def _find_project_memory(start):
+    """Walk up from start to find .git, return ~/.claude/projects/<slug>/memory/."""
+    home = Path.home().resolve()
+    for parent in [start] + list(start.parents):
+        if (parent / ".git").exists():
+            slug = _slugify(parent.name)
+            return home / ".claude" / "projects" / slug / "memory"
+    return home / ".claude" / "global" / "memory"
+
+
+def find_hot_list_target(memory_dir, scope_label):
+    """Return CLAUDE.md (global) or MEMORY.md (project) path."""
+    home = Path.home().resolve()
+    if scope_label == "global":
+        return home / ".claude" / "CLAUDE.md"
+    else:
+        return home / ".claude" / "projects" / scope_label / "MEMORY.md"
+
+
 # ── CLI Entry Point ───────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Claude Code Memory Sync")
-    parser.add_argument("--files", nargs="*", help="Specific memory files to sync")
-    parser.add_argument("--project", help="Path to project .claude directory")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--dry-run", action="store_true", help="Don't write files")
-    parser.add_argument("--fix", action="store_true", help="Auto-fix warnings in memory files")
-    parser.add_argument("--global", dest="global_dir", metavar="DIR",
-                        help="Sync global memory directory (e.g., ~/.claude/memory/)")
-    parser.add_argument("--migrate-to-global", nargs=2, metavar=("SRC", "DEST"),
-                        help="Migrate memories from pseudo-project to global directory")
-    parser.add_argument("--audit", action="store_true",
-                        help="Find memory pairs that may have conflicting information")
+    parser = argparse.ArgumentParser(description="Memory Graph v2 — sync engine")
+    parser.add_argument("--fix", action="store_true", help="Remove broken references")
+    parser.add_argument("--dry-run", action="store_true", help="Preview changes, no writes")
+    parser.add_argument("--audit", action="store_true", help="Find contradiction candidates")
+    parser.add_argument("--json", action="store_true", help="Output INDEX.json to stdout")
+    parser.add_argument("--hit", metavar="SLUG", help="Record a recall hit for a memory")
+    parser.add_argument("--scope-from-file", metavar="PATH",
+                        help="Detect scope from file path (for PostToolUse hook)")
     args = parser.parse_args()
 
-    # ── Migration mode ────────────────────────────────────────────────────
-    if args.migrate_to_global:
-        src_dir = Path(args.migrate_to_global[0])
-        dest_dir = Path(args.migrate_to_global[1])
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        if not src_dir.exists():
-            print(f"Source directory not found: {src_dir}", file=sys.stderr)
-            sys.exit(1)
+    if args.hit:
+        record_hit(args.hit)
+        print(f"Hit recorded for: {args.hit}")
+        return
 
-        count = 0
-        for md_file in sorted(src_dir.glob("*.md")):
-            if md_file.name in ("INDEX.md", "MEMORY.md"):
-                continue
-            dest_file = dest_dir / md_file.name
-            dest_file.write_text(md_file.read_text(encoding="utf-8"), encoding="utf-8")
-            md_file.unlink()
-            count += 1
-            print(f"  migrated: {md_file.name}")
-
-        # Remove source dir if empty of .md files
-        remaining = list(src_dir.glob("*.md"))
-        if not remaining:
-            try:
-                src_dir.rmdir()
-            except OSError:
-                pass  # non-empty or permissions
-
-        print(f"Migrated {count} memories: {src_dir} -> {dest_dir}")
-        # Run sync on destination to rebuild INDEX
-        memory_dir = dest_dir
-        args.dry_run = False  # always write after migration
-
-    # Determine memory directory
-    elif args.global_dir:
-        memory_dir = Path(args.global_dir)
-    elif args.project:
-        memory_dir = Path(args.project) / "memory"
-    else:
-        cwd = Path.cwd()
-        project_slug = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd).replace(":", "").replace("\\", "-"))
-        memory_dir = Path.home() / ".claude" / "projects" / project_slug / "memory"
-
-    if not memory_dir.exists() and args.migrate_to_global:
-        pass  # just created by migration
-    elif not memory_dir.exists():
-        print(f"Memory directory not found: {memory_dir}", file=sys.stderr)
-        sys.exit(1)
+    # Detect scope
+    memory_dir, scope_label = detect_scope(
+        cwd=Path.cwd(), scope_from_file=args.scope_from_file
+    )
+    if not memory_dir.exists():
+        memory_dir.mkdir(parents=True, exist_ok=True)
 
     # Load previous state
     prev_index = load_previous_index(memory_dir / "INDEX.json")
 
     # Scan
-    records, changed_slugs, affected_slugs = scan_memory_dir(memory_dir, prev_index, args.files)
-
+    records, changed_slugs, affected_slugs = scan_memory_dir(memory_dir, prev_index)
     if not records:
+        if not args.dry_run:
+            (memory_dir / "INDEX.md").write_text("# Memory Index\n\n*0 memories*\n", encoding="utf-8")
+            (memory_dir / "INDEX.json").write_text(json.dumps({"project": "memory", "files": {}, "warnings": [], "graph": {}}, indent=2), encoding="utf-8")
+            hot_target = find_hot_list_target(memory_dir, scope_label)
+            if hot_target:
+                inject_hot_list([], {}, hot_target, scope_label)  # clears to empty list
         msg = json.dumps({"warnings": [], "message": "No memories found"}, indent=2) if args.json else "No memories found."
         print(msg)
         return
 
-    # Build graph, compute degrees
+    # Build graph
     graph = build_graph(records)
     in_deg, out_deg = compute_degrees(graph)
-    # Include all known slugs from previous index (prevents false broken-ref
-    # warnings in --files mode where only a subset of files are scanned)
     known_slugs = set(graph.keys())
     known_slugs.update(prev_index.get("files", {}).keys())
 
-    # Validate and score
+    # Validate + score
     all_warnings = []
     scores = {}
     for r in records:
         meta = r.get("metadata", {})
         body = r.get("body", "")
         stored_hash = r.get("stored_hash", "")
-        actual_hash = r.get("_actual_hash", stored_hash)
         slug = r["slug"]
-        ind = in_deg.get(slug, 0)
+        r["_filepath"] = memory_dir / f"{slug}.md"
 
-        warns, actual_hash = validate(meta, body, stored_hash, known_slugs, ind, r.get("_text", ""))
+        warns, actual_hash = validate(meta, body, stored_hash, known_slugs, r["_filepath"])
         all_warnings.extend(warns)
+        r["_actual_hash"] = actual_hash
+        r["sync_status"] = (
+            "needs-review" if any(w["level"] == "error" for w in warns)
+            else "stale" if any(w["level"] == "warning" for w in warns)
+            else "synced"
+        )
+        meta["_filepath"] = r["_filepath"]
+        prev_entry = prev_index.get("files", {}).get(slug, {})
+        last_hit = prev_entry.get("last_hit")
+        scores[slug] = compute_score(meta, in_deg.get(slug, 0), out_deg.get(slug, 0), last_hit)
 
-        # Determine sync_status
-        if any(w["level"] == "error" for w in warns):
-            r["sync_status"] = "needs-review"
-        elif any(w["level"] == "warning" for w in warns):
-            r["sync_status"] = "stale"
-        else:
-            r["sync_status"] = "synced"
-
-        if not r.get("_actual_hash"):
-            r["_actual_hash"] = actual_hash
-        scores[slug] = compute_score(meta, ind, out_deg.get(slug, 0))
-
-    project_name = memory_dir.parent.name
-
-    # ── Fix engine ──────────────────────────────────────────────────────────
-    fixes_applied = []
+    # --fix
     if args.fix:
-        fixes_applied = apply_fixes(records, known_slugs, memory_dir, dry_run=args.dry_run)
-
-        if fixes_applied:
-            # Re-validate after fixes (metadata changed in-memory and on-disk)
+        fixes = apply_fixes(records, known_slugs, memory_dir, dry_run=args.dry_run)
+        if fixes:
+            for f in fixes:
+                print(f"  FIXED [{f['check']}] {f['slug']}: {f['detail']}")
+            # Re-validate after fixes
+            graph = build_graph(records)
+            in_deg, out_deg = compute_degrees(graph)
+            known_slugs = set(graph.keys()) | set(prev_index.get("files", {}).keys())
             all_warnings = []
             for r in records:
-                meta = r.get("metadata", {})
-                body = r.get("body", "")
-                stored_hash = r.get("stored_hash", "")
-                slug = r["slug"]
-                ind = in_deg.get(slug, 0)
-
-                warns, actual_hash = validate(meta, body, stored_hash, known_slugs, ind, r.get("_text", ""))
+                warns, _ = validate(r["metadata"], r["body"], r.get("stored_hash", ""),
+                                   known_slugs, r["_filepath"])
                 all_warnings.extend(warns)
+                r["metadata"]["_filepath"] = r["_filepath"]
+                prev_entry_fix = prev_index.get("files", {}).get(r["slug"], {})
+                last_hit_fix = prev_entry_fix.get("last_hit")
+                scores[r["slug"]] = compute_score(r["metadata"], in_deg.get(r["slug"], 0),
+                                                   out_deg.get(r["slug"], 0), last_hit_fix)
 
-                if any(w["level"] == "error" for w in warns):
-                    r["sync_status"] = "needs-review"
-                elif any(w["level"] == "warning" for w in warns):
-                    r["sync_status"] = "stale"
-                else:
-                    r["sync_status"] = "synced"
-
-                if not r.get("_actual_hash"):
-                    r["_actual_hash"] = actual_hash
-
-            # Print fix summary
-            for f in fixes_applied:
-                print(f"  FIXED [{f['check']}] {f['slug']}: {f['detail']}")
-
-    # Rebuild graph after fixes (references may have changed)
-    if fixes_applied:
-        graph = build_graph(records)
-        in_deg, out_deg = compute_degrees(graph)
-        known_slugs = set(graph.keys())
-        known_slugs.update(prev_index.get("files", {}).keys())
-        # Re-score
-        for r in records:
-            slug = r["slug"]
-            meta = r.get("metadata", {})
-            scores[slug] = compute_score(meta, in_deg.get(slug, 0), out_deg.get(slug, 0))
-
-    # ── Audit candidates ───────────────────────────────────────────────────
+    # --audit
     if args.audit:
         candidates = audit_candidates(records)
         if args.json:
             print(json.dumps({"candidates": candidates}, indent=2, ensure_ascii=False))
             return
         if candidates:
-            print("\nAudit Candidates (model review suggested)")
-            print("─────────────────────────────────────────")
+            print("\nAudit Candidates:")
             for c in candidates:
-                print(f"\n{c['a']} ↔ {c['b']}")
-                print(f"  shared tags:     {c['shared_tags']}")
-                print(f"  shared headings: {c['shared_headings']}")
-                print(f"  updated:         {c['updated_a']} / {c['updated_b']}")
-                print(f"  suggestion:      {c['suggestion']}")
+                print(f"  {c['a']} ↔ {c['b']} — shared refs: {c['shared_refs']}, discuss: {c['shared_headings']}")
         else:
-            print("\nNo audit candidates found.")
+            print("No audit candidates found.")
+        return
 
-    # Writeback content_hash FIRST so INDEX.json has accurate hashes
+    # Print read-when hints for weak memories
+    for r in records:
+        rw = r.get("metadata", {}).get("read_when", []) or []
+        if not rw or all(len(p.strip()) < 10 for p in rw):
+            hints = suggest_read_when(r.get("body", ""))
+            if hints:
+                print(f"\n  Read-when hints for '{r['slug']}':")
+                for h in hints:
+                    print(f"    - {h}")
+
+    # Store updated dates before writeback pops _filepath
+    for r in records:
+        fp = memory_dir / f"{r['slug']}.md"
+        if fp.exists():
+            r["_updated_str"] = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    # Writeback content_hash to INDEX.json (not to .md files)
     if not args.dry_run:
         writeback_content_hash(records, memory_dir)
 
-    # Generate outputs (after writeback so stored_hash is populated)
-    index_md = build_index_md(records, all_warnings, scores, in_deg, out_deg, memory_dir)
-    index_json = build_index_json(project_name, memory_dir, records, all_warnings, scores, in_deg, out_deg, graph)
+    # Generate INDEX.md
+    index_md = build_index_md(records, all_warnings, scores, in_deg, out_deg)
+    index_json = build_index_json("memory", memory_dir, records, all_warnings, scores, in_deg, out_deg, graph, prev_index)
 
     if args.json:
         print(index_json)
@@ -1349,6 +1017,12 @@ def main():
     if not args.dry_run:
         (memory_dir / "INDEX.md").write_text(index_md, encoding="utf-8")
         (memory_dir / "INDEX.json").write_text(index_json, encoding="utf-8")
+
+        # Inject hot list (auto-creates target file + markers if needed)
+        hot_target = find_hot_list_target(memory_dir, scope_label)
+        if hot_target:
+            inject_hot_list(records, scores, hot_target, scope_label)
+
         print(f"INDEX.md written ({len(records)} memories)")
 
     # Summary
@@ -1357,9 +1031,8 @@ def main():
     review = sum(1 for r in records if r["sync_status"] == "needs-review")
     errors_n = sum(1 for w in all_warnings if w["level"] == "error")
     warns_n = sum(1 for w in all_warnings if w["level"] == "warning")
-    infos_n = sum(1 for w in all_warnings if w["level"] == "info")
     print(f"  synced: {synced}  |  stale: {stale}  |  needs-review: {review}")
-    print(f"  errors: {errors_n}  |  warnings: {warns_n}  |  info: {infos_n}")
+    print(f"  errors: {errors_n}  |  warnings: {warns_n}")
 
     if all_warnings:
         print(f"\n{len(all_warnings)} issue(s):")

@@ -1,8 +1,8 @@
-# Memory-Graph v2 Implementation Plan
+# memory-lifecycle v2 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rewrite memory-graph from 12-field metadata + push recall + 14 noisy checks into 4-field metadata + two-tier pull recall + 4 focused checks.
+**Goal:** Rewrite memory-lifecycle from 12-field metadata + push recall + 14 noisy checks into 4-field metadata + two-tier pull recall + 4 focused checks.
 
 **Architecture:** `memory-sync.py` scans `.md` files in `~/.claude/memory/` (global) or `<git>/.claude/memory/` (project), parses 4-field frontmatter, validates (4 checks), scores (graph degree + freshness), writes INDEX.md (flat, sorted) and injects Top-N hot links into CLAUDE.md/MEMORY.md. `remove-memory.py` safely deletes a memory and cleans dangling references. A PostToolUse hook auto-syncs on Write/Edit.
 
@@ -22,10 +22,10 @@
 ### Task 1: Update templates and reference docs
 
 **Files:**
-- Create: `skills/memory-graph/templates/memory-template.md` (overwrite)
-- Create: `skills/memory-graph/references/checks-reference.md` (overwrite)
-- Create: `skills/memory-graph/references/memory-writing-template.md` (overwrite)
-- Create: `skills/memory-graph/references/cli-reference.md` (overwrite)
+- Create: `skills/memory-lifecycle/templates/memory-template.md` (overwrite)
+- Create: `skills/memory-lifecycle/references/checks-reference.md` (overwrite)
+- Create: `skills/memory-lifecycle/references/memory-writing-template.md` (overwrite)
+- Create: `skills/memory-lifecycle/references/cli-reference.md` (overwrite)
 
 **Interfaces:**
 - Consumes: nothing
@@ -163,8 +163,8 @@ PostToolUse hook uses `--scope-from-file <path>` instead.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add skills/memory-graph/templates/ skills/memory-graph/references/
-git commit -m "docs: update memory-graph templates and references for v2"
+git add skills/memory-lifecycle/templates/ skills/memory-lifecycle/references/
+git commit -m "docs: update memory-lifecycle templates and references for v2"
 ```
 
 ---
@@ -172,7 +172,7 @@ git commit -m "docs: update memory-graph templates and references for v2"
 ### Task 2: Rewrite `memory-sync.py` — frontmatter parser
 
 **Files:**
-- Modify: `skills/memory-graph/scripts/memory-sync.py` (full rewrite, this task does the parser)
+- Modify: `skills/memory-lifecycle/scripts/memory-sync.py` (full rewrite, this task does the parser)
 
 **Interfaces:**
 - Consumes: nothing
@@ -275,11 +275,11 @@ def _parse_scalar(value: str):
 
 - [ ] **Step 2: Write parser tests**
 
-Create `skills/memory-graph/tests/test_parser.py`:
+Create `skills/memory-lifecycle/tests/test_parser.py`:
 
 ```python
 import sys
-sys.path.insert(0, "skills/memory-graph/scripts")
+sys.path.insert(0, "skills/memory-lifecycle/scripts")
 from memory_sync import parse_frontmatter
 
 def test_minimal_frontmatter():
@@ -335,14 +335,14 @@ def test_no_frontmatter():
 - [ ] **Step 3: Run test to verify parser**
 
 ```bash
-python -m pytest skills/memory-graph/tests/test_parser.py -v
+python -m pytest skills/memory-lifecycle/tests/test_parser.py -v
 ```
 Expected: 4 PASS
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/memory-sync.py skills/memory-graph/tests/test_parser.py
+git add skills/memory-lifecycle/scripts/memory-sync.py skills/memory-lifecycle/tests/test_parser.py
 git commit -m "feat: v2 frontmatter parser — 4 fields, no metadata nesting"
 ```
 
@@ -351,8 +351,8 @@ git commit -m "feat: v2 frontmatter parser — 4 fields, no metadata nesting"
 ### Task 3: Rewrite `memory-sync.py` — validation + scoring
 
 **Files:**
-- Modify: `skills/memory-graph/scripts/memory-sync.py` (add validate_v2, compute_score)
-- Create: `skills/memory-graph/tests/test_validate.py`
+- Modify: `skills/memory-lifecycle/scripts/memory-sync.py` (add validate_v2, compute_score)
+- Create: `skills/memory-lifecycle/tests/test_validate.py`
 
 **Interfaces:**
 - Consumes: `parse_frontmatter()` from Task 2
@@ -480,14 +480,14 @@ def test_clean_memory():
 - [ ] **Step 4: Run validate tests**
 
 ```bash
-python -m pytest skills/memory-graph/tests/test_validate.py -v
+python -m pytest skills/memory-lifecycle/tests/test_validate.py -v
 ```
 Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/memory-sync.py skills/memory-graph/tests/test_validate.py
+git add skills/memory-lifecycle/scripts/memory-sync.py skills/memory-lifecycle/tests/test_validate.py
 git commit -m "feat: v2 validation (4 checks) + scoring (graph degree + freshness)"
 ```
 
@@ -496,8 +496,8 @@ git commit -m "feat: v2 validation (4 checks) + scoring (graph degree + freshnes
 ### Task 4: Rewrite `memory-sync.py` — INDEX.md + hot-list generation
 
 **Files:**
-- Modify: `skills/memory-graph/scripts/memory-sync.py` (add build_index_md, inject_hot_list)
-- Create: `skills/memory-graph/tests/test_index.py`
+- Modify: `skills/memory-lifecycle/scripts/memory-sync.py` (add build_index_md, inject_hot_list)
+- Create: `skills/memory-lifecycle/tests/test_index.py`
 
 **Interfaces:**
 - Consumes: `validate()`, `compute_score()`, graph from `build_graph()` / `compute_degrees()`
@@ -685,14 +685,14 @@ def test_hot_list_no_markers():
 - [ ] **Step 4: Run INDEX tests**
 
 ```bash
-python -m pytest skills/memory-graph/tests/test_index.py -v
+python -m pytest skills/memory-lifecycle/tests/test_index.py -v
 ```
 Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/memory-sync.py skills/memory-graph/tests/test_index.py
+git add skills/memory-lifecycle/scripts/memory-sync.py skills/memory-lifecycle/tests/test_index.py
 git commit -m "feat: v2 INDEX.md generation + hot-list injection"
 ```
 
@@ -701,8 +701,8 @@ git commit -m "feat: v2 INDEX.md generation + hot-list injection"
 ### Task 5: Rewrite `memory-sync.py` — scope detection + CLI + main
 
 **Files:**
-- Modify: `skills/memory-graph/scripts/memory-sync.py` (add detect_scope, rewrite main())
-- Create: `skills/memory-graph/tests/test_scope.py`
+- Modify: `skills/memory-lifecycle/scripts/memory-sync.py` (add detect_scope, rewrite main())
+- Create: `skills/memory-lifecycle/tests/test_scope.py`
 
 **Interfaces:**
 - Consumes: all functions from Tasks 2-4
@@ -781,7 +781,7 @@ def test_auto_detect_no_git(monkeypatch):
 - [ ] **Step 3: Run scope tests**
 
 ```bash
-python -m pytest skills/memory-graph/tests/test_scope.py -v
+python -m pytest skills/memory-lifecycle/tests/test_scope.py -v
 ```
 Expected: 2 PASS
 
@@ -921,7 +921,7 @@ def main():
 - [ ] **Step 5: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/memory-sync.py skills/memory-graph/tests/test_scope.py
+git add skills/memory-lifecycle/scripts/memory-sync.py skills/memory-lifecycle/tests/test_scope.py
 git commit -m "feat: v2 scope detection + CLI + main orchestration"
 ```
 
@@ -930,7 +930,7 @@ git commit -m "feat: v2 scope detection + CLI + main orchestration"
 ### Task 6: Remove legacy code from `memory-sync.py`
 
 **Files:**
-- Modify: `skills/memory-graph/scripts/memory-sync.py`
+- Modify: `skills/memory-lifecycle/scripts/memory-sync.py`
 
 **Interfaces:**
 - Consumes: all v2 functions from Tasks 2-5
@@ -1032,20 +1032,20 @@ def apply_fixes(records: list, known_slugs: set, memory_dir: Path,
 - [ ] **Step 2: Verify the file has no syntax errors**
 
 ```bash
-python -c "import sys; sys.path.insert(0, 'skills/memory-graph/scripts'); import memory_sync; print('OK')"
+python -c "import sys; sys.path.insert(0, 'skills/memory-lifecycle/scripts'); import memory_sync; print('OK')"
 ```
 
 - [ ] **Step 3: Run full test suite**
 
 ```bash
-python -m pytest skills/memory-graph/tests/ -v
+python -m pytest skills/memory-lifecycle/tests/ -v
 ```
 Expected: all PASS (10+ tests)
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/memory-sync.py
+git add skills/memory-lifecycle/scripts/memory-sync.py
 git commit -m "refactor: remove v1 dead code — TTL, tags, context, confidence, priority, type, tiers"
 ```
 
@@ -1054,8 +1054,8 @@ git commit -m "refactor: remove v1 dead code — TTL, tags, context, confidence,
 ### Task 7: Create `remove-memory.py`
 
 **Files:**
-- Create: `skills/memory-graph/scripts/remove-memory.py`
-- Create: `skills/memory-graph/tests/test_remove.py`
+- Create: `skills/memory-lifecycle/scripts/remove-memory.py`
+- Create: `skills/memory-lifecycle/tests/test_remove.py`
 
 **Interfaces:**
 - Consumes: scope detection from memory-sync (duplicated inline for standalone script)
@@ -1197,14 +1197,14 @@ def test_remove_reference_line(tmp_path):
 - [ ] **Step 3: Run remove-memory tests**
 
 ```bash
-python -m pytest skills/memory-graph/tests/test_remove.py -v
+python -m pytest skills/memory-lifecycle/tests/test_remove.py -v
 ```
 Expected: 2 PASS
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add skills/memory-graph/scripts/remove-memory.py skills/memory-graph/tests/test_remove.py
+git add skills/memory-lifecycle/scripts/remove-memory.py skills/memory-lifecycle/tests/test_remove.py
 git commit -m "feat: remove-memory.py — safe delete + ref cleanup + INDEX rebuild"
 ```
 
@@ -1213,7 +1213,7 @@ git commit -m "feat: remove-memory.py — safe delete + ref cleanup + INDEX rebu
 ### Task 8: Rewrite `skill.md`
 
 **Files:**
-- Modify: `skills/memory-graph/skill.md` (overwrite)
+- Modify: `skills/memory-lifecycle/skill.md` (overwrite)
 
 **Interfaces:**
 - Consumes: spec section 2.10
@@ -1223,7 +1223,7 @@ git commit -m "feat: remove-memory.py — safe delete + ref cleanup + INDEX rebu
 
 ```markdown
 ---
-name: memory-graph
+name: memory-lifecycle
 description: Use when writing or editing memory files, recalling past fixes/patterns, running sync-memory to validate the knowledge graph, or safely removing memories
 ---
 
@@ -1288,8 +1288,8 @@ remove-memory <slug>     # safe delete with ref cleanup
 - [ ] **Step 2: Commit**
 
 ```bash
-git add skills/memory-graph/skill.md
-git commit -m "docs: rewrite skill.md for memory-graph v2"
+git add skills/memory-lifecycle/skill.md
+git commit -m "docs: rewrite skill.md for memory-lifecycle v2"
 ```
 
 ---
@@ -1366,7 +1366,7 @@ In `~/.claude/settings.json`, under `"hooks"`, add:
     "hooks": [
       {
         "type": "command",
-        "command": "python C:\\Users\\skyde\\.claude\\skills\\memory-graph\\scripts\\memory-sync.py",
+        "command": "python C:\\Users\\skyde\\.claude\\skills\\memory-lifecycle\\scripts\\memory-sync.py",
         "async": true
       }
     ]
@@ -1384,7 +1384,7 @@ variable name.
 - [ ] **Step 4: Run first sync to build INDEX + hot list**
 
 ```bash
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\memory-sync.py
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\memory-sync.py
 ```
 Expected: INDEX.md written, hot list injected into CLAUDE.md
 
@@ -1429,7 +1429,7 @@ EOF
 - [ ] **Step 2: Run sync and verify INDEX.md**
 
 ```bash
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\memory-sync.py
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\memory-sync.py
 Select-String "e2e-test" ~/.claude/memory/INDEX.md
 ```
 Expected: e2e-test appears in INDEX.md with read-when phrases
@@ -1438,28 +1438,28 @@ Expected: e2e-test appears in INDEX.md with read-when phrases
 
 ```bash
 # e2e-test references 'tt-statusline-pricing-fix' which exists — should be clean
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\memory-sync.py
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\memory-sync.py
 ```
 Expected: 0 errors
 
 - [ ] **Step 4: Test remove-memory (dry-run first)**
 
 ```bash
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\remove-memory.py e2e-test --dry-run
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\remove-memory.py e2e-test --dry-run
 ```
 Expected: Shows what would be deleted, no files changed
 
 - [ ] **Step 5: Test actual remove**
 
 ```bash
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\remove-memory.py e2e-test --yes
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\remove-memory.py e2e-test --yes
 ```
 Expected: File deleted, INDEX rebuilt, no broken refs
 
 - [ ] **Step 6: Verify clean state**
 
 ```bash
-python C:\Users\skyde\.claude\skills\memory-graph\scripts\memory-sync.py
+python C:\Users\skyde\.claude\skills\memory-lifecycle\scripts\memory-sync.py
 ```
 Expected: 0 errors, synced: 4
 
@@ -1467,5 +1467,5 @@ Expected: 0 errors, synced: 4
 
 ```bash
 git add -A
-git commit -m "test: e2e integration test for memory-graph v2 pipeline"
+git commit -m "test: e2e integration test for memory-lifecycle v2 pipeline"
 ```

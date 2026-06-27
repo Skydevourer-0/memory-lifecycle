@@ -153,12 +153,13 @@ If a `read-when` phrase matches, Read the linked `.md` file. Zero cost if nothin
 ## Removing a Memory
 
 ```
-python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug>
-python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug> --yes     # skip prompts
-python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug> --dry-run # preview only
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --delete <slug>
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --delete <slug> --yes     # skip confirmation
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --delete <slug> --dry-run # preview only
 ```
 
 Deletes the `.md` file, cleans dangling references in other memories, rebuilds INDEX.
+`remove-memory.py` is a thin wrapper that forwards to `--delete`. Either entry point works.
 
 ## Commands
 
@@ -171,6 +172,6 @@ python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix --dry-run 
 python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --dry-run    # validate only, no writes
 python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --audit      # contradiction candidates
 python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --json       # output INDEX.json
-python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --hit <slug>   # record recall hit (run after grep + Read)
-python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug>     # safe delete + ref cleanup
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --hit <slug>     # record recall hit (run after grep + Read)
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --delete <slug>  # safe delete + ref cleanup + rebuild INDEX
 ```

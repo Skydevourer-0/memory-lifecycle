@@ -943,6 +943,8 @@ def main():
     parser.add_argument("--audit", action="store_true", help="Find contradiction candidates")
     parser.add_argument("--json", action="store_true", help="Output INDEX.json to stdout")
     parser.add_argument("--hit", metavar="SLUG", help="Record a recall hit for a memory")
+    parser.add_argument("--delete", metavar="SLUG", help="Remove a memory and clean up references")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation for --delete")
     parser.add_argument("--scope-from-file", metavar="PATH",
                         help="Detect scope from file path (for PostToolUse hook)")
     args = parser.parse_args()
@@ -958,6 +960,79 @@ def main():
     )
     if not memory_dir.exists():
         memory_dir.mkdir(parents=True, exist_ok=True)
+
+    # --delete: remove a memory and clean dangling references, then rebuild INDEX
+    if args.delete:
+        slug = args.delete
+        md_file = memory_dir / f"{slug}.md"
+        if not md_file.exists():
+            print(f"Memory not found: {md_file}", file=sys.stderr)
+            sys.exit(1)
+
+        # Find files referencing this slug
+        refs = []
+        for fp in sorted(memory_dir.glob("*.md")):
+            if fp.stem == slug or fp.name in ("INDEX.md", "MEMORY.md"):
+                continue
+            text = safe_read_text(fp)
+            if text is None or not text.startswith("---"):
+                continue
+            end = text.find("---", 3)
+            if end == -1:
+                continue
+            fm = text[3:end]
+            for line in fm.split("\n"):
+                stripped = line.strip()
+                if stripped in (f"- {slug}", f"[{slug}]", f"references: [{slug}]"):
+                    refs.append(fp)
+                    break
+
+        if refs:
+            print(f"Files referencing '{slug}':")
+            for rf in refs:
+                print(f"  {rf.name}")
+        else:
+            print(f"No files reference '{slug}'.")
+
+        if args.dry_run:
+            print(f"\nWould delete: {md_file}")
+            if refs:
+                print(f"Would clean references from {len(refs)} file(s).")
+            return
+
+        if not args.yes:
+            response = input(f"\nDelete '{slug}.md'? [y/N] ").strip().lower()
+            if response != "y":
+                print("Aborted.")
+                return
+
+        # Clean references
+        for rf in refs:
+            content = safe_read_text(rf)
+            if content is None:
+                continue
+            end = content.find("---", 3)
+            fm = content[3:end]
+            body_rest = content[end:]
+            lines = fm.split("\n")
+            new_lines = []
+            changed = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped in (f"- {slug}", f"[{slug}]", f"references: [{slug}]"):
+                    changed = True
+                    continue
+                new_lines.append(line)
+            if changed:
+                new_content = "---" + "\n".join(new_lines) + body_rest
+                rf.write_text(new_content, encoding="utf-8")
+                print(f"  Cleaned: {rf.name}")
+
+        # Delete the file
+        md_file.unlink()
+        print(f"Deleted: {md_file}")
+        # Fall through to normal sync to rebuild INDEX
+        print("Rebuilding INDEX...")
 
     # Load previous state
     prev_index = load_previous_index(memory_dir / "INDEX.json")

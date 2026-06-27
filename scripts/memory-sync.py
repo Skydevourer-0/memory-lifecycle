@@ -27,55 +27,49 @@ FENCED_BLOCK_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 
 # ── Frontmatter Parser ───────────────────────────────────────────────────────
 
-def _parse_yaml_value(value: str):
-    """Parse a single YAML-like scalar value."""
+def _parse_scalar(value: str):
+    """Parse a single YAML-like scalar or inline list."""
     value = value.strip().strip("\"'")
-    if not value:
+    if not value or value.lower() in ("null", "none", "~"):
         return None
     if value == "[]":
         return []
-    if value.lower() in ("null", "none", "~"):
-        return None
-    # List literal: [a, b, c]
     if value.startswith("[") and value.endswith("]"):
         inner = value[1:-1].strip()
         if not inner:
             return []
         return [item.strip().strip("\"'") for item in inner.split(",") if item.strip()]
-    # Boolean
     if value.lower() == "true":
         return True
     if value.lower() == "false":
         return False
-    # Integer
     try:
         return int(value)
     except ValueError:
         pass
-    # Float
     try:
         return float(value)
     except ValueError:
         pass
-    # Plain string
     return value
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML-like frontmatter between --- delimiters.
+    """Parse v2 frontmatter from a memory .md file.
 
-    Handles both inline format (tags: [a, b]) and YAML block format
-    (tags:\\n  - a\\n  - b). Also handles Claude Code's native format
-    where extended fields are nested under 'metadata:'.
+    v2 format — 4 fields at top level:
+      name: kebab-case
+      description: one sentence
+      references: [] or list of slugs
+      read-when: [] or list of natural-language phrases
 
     Returns (metadata_dict, body_string).
-    If no frontmatter is found, returns ({}, text.strip()).
+    If no frontmatter, returns ({}, text.strip()).
     """
     text = text.strip()
     if not text.startswith("---"):
         return {}, text
 
-    # Find the closing --- delimiter
     end_idx = text.find("---", 3)
     if end_idx == -1:
         return {}, text
@@ -83,84 +77,42 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     raw_front = text[3:end_idx].strip()
     body = text[end_idx + 3:].strip()
 
-    meta: dict = {}
-    lines = raw_front.split("\n")
-    current_key: str | None = None
-    current_list: list | None = None
-    current_list_parent: str | None = None
+    meta = {"references": [], "read_when": []}
+    current_key = None
+    current_list = None
 
-    for line in lines:
+    for line in raw_front.split("\n"):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
 
         indent = len(line) - len(line.lstrip())
 
-        # YAML block list item: "- value"
-        if stripped.startswith("- "):
-            item_val = _parse_yaml_value(stripped[2:])
-            if current_list is not None:
-                current_list.append(item_val)
+        if stripped.startswith("- ") and current_list is not None:
+            current_list.append(stripped[2:].strip().strip("\"'"))
             continue
 
-        if indent == 0:
-            # Top-level key: value or key:
-            current_list = None
-            current_list_parent = None
-            if ":" not in stripped:
-                current_key = None
-                continue
+        if ":" in stripped and indent == 0:
             key, _, raw_val = stripped.partition(":")
             key = key.strip()
             raw_val = raw_val.strip()
-            current_key = key
 
-            val = _parse_yaml_value(raw_val)
-            if val is None and raw_val == "":
-                # Bare key — may start a block list or nested dict
-                meta[key] = {}
-                current_list = None
-            else:
-                meta[key] = val
-
-        elif indent > 0 and current_key is not None:
-            if ":" in stripped:
-                sub_key, _, raw_val = stripped.partition(":")
-                sub_key = sub_key.strip()
-                raw_val = raw_val.strip()
-
-                # Ensure parent is a dict
-                parent = meta.get(current_key)
-                if not isinstance(parent, dict):
-                    meta[current_key] = {}
-                    parent = meta[current_key]
-
-                val = _parse_yaml_value(raw_val)
-                if val is None and raw_val == "":
-                    # Bare sub-key — may start a list
-                    parent[sub_key] = []
-                    current_list = parent[sub_key]
-                    current_list_parent = sub_key
-                else:
-                    parent[sub_key] = val
+            if key == "references" or key == "read-when":
+                current_key = key
+                current_list = []
+                meta["read_when" if key == "read-when" else "references"] = current_list
+                val = _parse_scalar(raw_val)
+                if isinstance(val, list):
+                    current_list = val
+                    meta["read_when" if key == "read-when" else "references"] = current_list
                     current_list = None
-                    current_list_parent = None
-
-    # Post-parse: flatten metadata.* to top level
-    # Claude Code nests tags/context/references/confidence/priority/etc under 'metadata:'
-    if isinstance(meta.get("metadata"), dict):
-        inner = meta["metadata"]
-        # Preserve type for validation (metadata.type is the canonical location)
-        if "type" in inner and "metadata" not in meta:
-            meta["metadata"] = {}
-        # Flatten known fields to top level, skip internal fields
-        for k, v in inner.items():
-            if k in ("node_type", "originSessionId"):
-                continue  # Claude Code internal fields — silently ignored
-            if k == "type":
-                meta.setdefault("metadata", {})["type"] = v
-            elif k not in meta:
-                meta[k] = v
+                elif val not in (None, ""):
+                    current_list.append(val)
+                    current_list = None
+            else:
+                current_key = None
+                current_list = None
+                meta[key] = _parse_scalar(raw_val)
 
     return meta, body
 

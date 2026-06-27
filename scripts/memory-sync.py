@@ -128,8 +128,11 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
     # Strip unknown fields — only keep v2 schema fields
     KNOWN = {"name", "description", "references", "read_when"}
+    unknown = [key for key in meta if key not in KNOWN]
+    if unknown:
+        meta["_unknown_fields"] = unknown
     for key in list(meta.keys()):
-        if key not in KNOWN:
+        if key not in KNOWN and key != "_unknown_fields":
             del meta[key]
 
     return meta, body
@@ -227,7 +230,17 @@ def validate(meta: dict, body: str, stored_hash: str,
             "suggestion": f"Remove broken references: {', '.join(broken)}"
         })
 
-    # Check 5: weak or empty read-when
+    # Check 5: unknown frontmatter fields
+    unknown_fields = meta.get("_unknown_fields", [])
+    if unknown_fields:
+        warnings.append({
+            "level": "error",
+            "check": "unknown-fields",
+            "detail": f"unknown frontmatter field(s): {', '.join(unknown_fields)}",
+            "suggestion": f"Remove invalid fields. Allowed: name, description, references, read-when"
+        })
+
+    # Check 6: weak or empty read-when
     rw = meta.get("read_when", []) or []
     if not rw:
         warnings.append({
@@ -550,13 +563,12 @@ def scan_memory_dir(memory_dir, prev_index, target_files=None):
         path_map[slug] = fp
 
         if actual_hash != prev_hash or target_files is not None or not prev_entry:
-            # Changed or forced — full parse needed
+            # Changed or forced — track for reference propagation
             changed_slugs.add(slug)
-            meta, _ = parse_frontmatter(text)
-            parsed[slug] = meta
-        else:
-            # Unchanged — reuse previous metadata
-            parsed[slug] = _prev_to_meta(prev_entry)
+        # Always parse frontmatter — schema validation (unknown fields, etc.)
+        # must run even when the body hash is unchanged
+        meta, _ = parse_frontmatter(text)
+        parsed[slug] = meta
 
     # Phase 2 — Reference propagation
     for slug in changed_slugs:
@@ -682,9 +694,50 @@ def _fix_references_on_disk(filepath, new_refs):
     filepath.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _rebuild_file_without_unknown_fields(filepath: Path, meta: dict, body: str) -> bool:
+    """Rebuild a memory file with only known frontmatter fields.
+
+    This is the enforcement mechanism for the v2 schema — if a user accidentally
+    writes an invalid field like ``metadata:``, the script strips it from the
+    file so the error is surfaced to the model immediately.
+
+    Returns True if the file was rewritten.
+    """
+    name = meta.get("name", "")
+    description = meta.get("description", "")
+    refs = meta.get("references") or []
+    rw = meta.get("read_when") or []
+
+    lines = ["---"]
+    lines.append(f"name: {name}")
+    lines.append(f"description: {description}")
+
+    if refs:
+        lines.append("references:")
+        for r in refs:
+            lines.append(f"  - {r}")
+    else:
+        lines.append("references: []")
+
+    if rw:
+        lines.append("read-when:")
+        for p in rw:
+            lines.append(f"  - {p}")
+    else:
+        lines.append("read-when: []")
+
+    lines.append("---")
+    lines.append("")
+    lines.append(body)
+    content = "\n".join(lines) + "\n"
+
+    filepath.write_text(content, encoding="utf-8")
+    return True
+
+
 def apply_fixes(records: list, known_slugs: set, memory_dir: Path,
                 dry_run: bool = False) -> list:
-    """Apply v2 fixes — only remove broken references."""
+    """Apply v2 fixes — remove broken references and unknown frontmatter fields."""
     fixes = []
     for record in records:
         slug = record["slug"]
@@ -950,6 +1003,58 @@ def main():
         prev_entry = prev_index.get("files", {}).get(slug, {})
         last_hit = prev_entry.get("last_hit")
         scores[slug] = compute_score(meta, in_deg.get(slug, 0), out_deg.get(slug, 0), last_hit)
+
+    # Auto-fix unknown frontmatter fields (always, not behind --fix)
+    unknown_fixes = []
+    for r in records:
+        meta = r.get("metadata", {})
+        unknown = meta.pop("_unknown_fields", [])
+        if unknown:
+            slug = r["slug"]
+            filepath = r["_filepath"]
+            body = r.get("body", "")
+            if not args.dry_run:
+                _rebuild_file_without_unknown_fields(filepath, meta, body)
+                # Re-parse to get clean meta
+                text = safe_read_text(filepath)
+                if text:
+                    clean_meta, clean_body = parse_frontmatter(text)
+                    r["metadata"] = clean_meta
+                    r["body"] = clean_body
+                    r["_actual_hash"] = file_hash(text)
+            unknown_fixes.append({
+                "slug": slug,
+                "check": "unknown-fields",
+                "detail": f"Removed unknown frontmatter field(s): {', '.join(unknown)}",
+            })
+
+    if unknown_fixes:
+        for f in unknown_fixes:
+            print(f"  FIXED [{f['check']}] {f['slug']}: {f['detail']}")
+        # Re-validate after unknown-field fixes
+        graph = build_graph(records)
+        in_deg, out_deg = compute_degrees(graph)
+        known_slugs = set(graph.keys()) | set(prev_index.get("files", {}).keys())
+        all_warnings = []
+        for r in records:
+            warns, actual_hash = validate(
+                r.get("metadata", {}), r.get("body", ""),
+                r.get("stored_hash", ""), known_slugs, r["_filepath"]
+            )
+            all_warnings.extend(warns)
+            r["_actual_hash"] = actual_hash
+            r["sync_status"] = (
+                "needs-review" if any(w["level"] == "error" for w in warns)
+                else "stale" if any(w["level"] == "warning" for w in warns)
+                else "synced"
+            )
+            r["metadata"]["_filepath"] = r["_filepath"]
+            prev_entry = prev_index.get("files", {}).get(r["slug"], {})
+            last_hit = prev_entry.get("last_hit")
+            scores[r["slug"]] = compute_score(
+                r["metadata"], in_deg.get(r["slug"], 0),
+                out_deg.get(r["slug"], 0), last_hit
+            )
 
     # --fix
     if args.fix:

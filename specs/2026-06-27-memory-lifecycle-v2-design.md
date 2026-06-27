@@ -1,10 +1,10 @@
-# Memory-Graph v2 Design Spec
+# memory-lifecycle v2 Design Spec
 
 *2026-06-27*
 
 ## 1. Problem
 
-Memory-graph v1 is hard to use and hard to trust.
+memory-lifecycle v1 is hard to use and hard to trust.
 
 **Metadata bloat.** The template has 12 fields (`name`, `description`, `type`, `tags`, `context`, `references`, `confidence`, `priority`, `created`, `updated`, `content_hash`, `ttl`). `context` auto-balloons to 40+ entries via `--fix`, most of them generic noise (`model`, `None`, `vscode`). `tags`, `priority`, `created`, `ttl` are hand-written but never meaningfully used for recall or scoring. `references` duplicates `[[wiki-links]]` in body. `content_hash` leaks an implementation detail into user-facing files.
 
@@ -240,7 +240,7 @@ Each entry on 2–3 lines:
 - Line 2: `read-when` keywords (for grep), or `read-when: (none)` if empty
 - Line 3 (optional): updated date + refs + score
 
-### 2.10 `memory-graph` skill SKILL.md
+### 2.10 `memory-lifecycle` skill SKILL.md
 
 Updated to describe v2 usage:
 
@@ -327,13 +327,13 @@ No migration command needed. The new sync engine handles v2 format only; v1-form
 
 | File | Action |
 |------|--------|
-| `skills/memory-graph/skill.md` | Rewrite for v2 |
-| `skills/memory-graph/scripts/memory-sync.py` | Rewrite: new metadata schema, 4 checks, simplified `--fix`, auto-detect scope, hot-list injection |
-| `skills/memory-graph/scripts/remove-memory.py` | **New** — safe delete + ref cleanup |
-| `skills/memory-graph/templates/memory-template.md` | Rewrite: 4-field template |
-| `skills/memory-graph/references/checks-reference.md` | Rewrite: 4 checks |
-| `skills/memory-graph/references/memory-writing-template.md` | Rewrite: simplified guide |
-| `skills/memory-graph/references/cli-reference.md` | Rewrite: simplified CLI |
+| `skills/memory-lifecycle/skill.md` | Rewrite for v2 |
+| `skills/memory-lifecycle/scripts/memory-sync.py` | Rewrite: new metadata schema, 4 checks, simplified `--fix`, auto-detect scope, hot-list injection |
+| `skills/memory-lifecycle/scripts/remove-memory.py` | **New** — safe delete + ref cleanup |
+| `skills/memory-lifecycle/templates/memory-template.md` | Rewrite: 4-field template |
+| `skills/memory-lifecycle/references/checks-reference.md` | Rewrite: 4 checks |
+| `skills/memory-lifecycle/references/memory-writing-template.md` | Rewrite: simplified guide |
+| `skills/memory-lifecycle/references/cli-reference.md` | Rewrite: simplified CLI |
 | `~/.claude/CLAUDE.md` | Sync writes `<!-- memory-index -->` block (global Top-N) |
 | `MEMORY.md` (per-project) | Sync writes `<!-- memory-index -->` block (project Top-N) |
 | `~/.claude/settings.json` | Add PostToolUse hook: Write/Edit on `memory/*.md` → auto-run sync |

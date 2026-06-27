@@ -24,7 +24,7 @@ remove-memory <slug> [--yes] [--dry-run]
 ## Scope Detection
 
 Sync auto-detects scope by walking CWD upward to find `.git`:
-- Found: project scope, memory dir = `<git-root>/.claude/memory/`
-- Not found: global scope, memory dir = `~/.claude/memory/`
+- Found: project scope, memory dir = `~/.claude/projects/<project-slug>/memory/`
+- Not found: global scope, memory dir = `~/.claude/global/memory/`
 
 PostToolUse hook uses `--scope-from-file <path>` instead.

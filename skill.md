@@ -1,94 +1,102 @@
 ---
-name: memory-graph
-description: Use when writing or editing memory files, running sync-memory to validate the knowledge graph, auditing for semantic contradictions, or setting up persistent knowledge infrastructure
+name: memory-lifecycle
+description: Use when writing or editing memory files, recalling past fixes/patterns, running sync-memory to validate the knowledge graph, or safely removing memories
 ---
 
-# Memory Graph
+# Memory Lifecycle
 
-Build and maintain a persistent knowledge graph as validated markdown files.
-The `sync-memory` script enforces 14 structural checks and can auto-fix 4
-classes of warnings.
+Persistent knowledge stored as markdown files. A sync engine validates structure,
+scores memories, and maintains a recall index.
 
-## Core Commands
+## Storage Paths
 
-```bash
-sync-memory                       # sync + rebuild INDEX
-sync-memory --fix                 # sync + auto-fix warnings
-sync-memory --audit               # find contradiction candidates
-sync-memory --global <dir>        # sync a global memory directory
-sync-memory --migrate-to-global S D  # move .md files S→D
+| Scope | Memory location | Index location | Hot-list target |
+|-------|----------------|----------------|-----------------|
+| Global | `~/.claude/global/memory/<slug>.md` | `~/.claude/global/memory/INDEX.md` | `~/.claude/CLAUDE.md` |
+| Project | `~/.claude/projects/<project>/memory/<slug>.md` | same dir | `~/.claude/projects/<project>/MEMORY.md` |
+
+`<project>` is the git root directory name, sanitized to kebab-case.
+`<slug>` is the memory name (kebab-case, matches filename stem).
+
+## Setup
+
+Run once:
+
+```
+python ~/.claude/skills/memory-lifecycle/scripts/install.py
+```
+(On Windows: `python $env:USERPROFILE\.claude\skills\memory-lifecycle\scripts\install.py`)
+
+This creates `~/.claude/global/memory/`, adds `<!-- memory-index:start -->` / `<!-- memory-index:end -->`
+markers to CLAUDE.md, and registers a PostToolUse hook that auto-syncs on memory Write/Edit.
+
+Project-scope setup is automatic — the first `sync-memory` run inside a git project
+creates `~/.claude/projects/<project>/MEMORY.md` and the memory directory.
+
+## Two-Tier Recall
+
+1. **HOT** — Top-scored links auto-written into the hot-list target (see table above).
+   Always in context. No action needed.
+2. **WARM** — Grep the INDEX.md for `read-when` phrases before non-trivial tasks:
+   ```
+   Grep "keyword" ~/.claude/global/memory/INDEX.md              # global
+   Grep "keyword" ~/.claude/projects/<project>/memory/INDEX.md   # project
+   ```
+   One file covers all memories. Zero cost if nothing matches.
+
+## Writing a Memory
+
+```yaml
+---
+name: my-topic
+description: One-line summary of what this memory contains
+references: []
+read-when:
+  - phrase you would grep to find this memory
+  - another scenario this helps with
+---
 ```
 
-Full CLI reference: `references/cli-reference.md`
+Body: any format. Recommended: `### entity-name — description` sections.
 
-## Writing a Memory File
+After writing, run sync:
+```
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py
+```
+The PostToolUse hook runs this automatically on Write/Edit to any `**/.claude/**/memory/*.md` file.
 
-Quick rules. Full guide: `references/memory-writing-template.md`
+## Recalling a Memory
 
-### Type Selection
+Before starting any non-trivial task, grep both INDEX files:
 
-| `type:` | For | Requires |
-|---------|-----|----------|
-| `reference` | Knowledge, patterns, debugging | `### entity — description` headings |
-| `feedback` | User preferences, corrections | `**Why:**` + `**How to apply:**` |
-| `project` | Project state, goals | `**Why:**` + `**How to apply:**` |
-| `task` | Work tracking | `skill:` field recommended |
-| `user` | Identity, role | Free-form |
+```
+Grep "keyword" ~/.claude/global/memory/INDEX.md                       # global scope
+Grep "keyword" ~/.claude/projects/*/memory/INDEX.md                   # all projects
+```
 
-### Body Structure
+If a `read-when` phrase matches, Read the linked `.md` file. Zero cost if nothing matches.
 
-- `## Section Labels` organize the document. They are NOT auto-tagged.
-- `### entity-name — description` marks each named entity. These ARE
-  auto-tagged by check #11. Every `###` heading must include a separator
-  (`—`, `:`, or `–`). Plain `### Problem` or `### Overview` headings
-  are section labels — use `##` or bold markers instead.
+## Removing a Memory
 
-### Language
+```
+python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug>
+python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug> --yes     # skip prompts
+python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug> --dry-run # preview only
+```
 
-All memory content — descriptions, body, headings — is written in English.
-Tags use kebab-case. CLI output to the terminal may be in the user's language.
+Deletes the `.md` file, cleans dangling references in other memories, rebuilds INDEX.
 
-### Template
+## Commands
 
-Copy `templates/memory-template.md` as a starting point for new `type: reference`
-memories. It has the frontmatter skeleton and body structure stubs.
+Full paths (use `$env:USERPROFILE` on Windows instead of `~`):
 
-## Responding to Sync Output
-
-After running `sync-memory`:
-
-| Level | Action |
-|-------|--------|
-| `[ERROR]` | Report. Do not continue without fixing. |
-| `[WARNING]` | Fix structurally (add tags, fix refs). Re-run sync. |
-| `[INFO]` | Report to user. Offer to fix. |
-
-After `--fix` adds inline-code terms to `context`: review the additions.
-Remove noise terms (single generic keywords). Keep meaningful entity
-references (command names, file paths, tool names).
-
-All 14 checks: `references/checks-reference.md`
-
-## Task Memory Format
-
-Task memories (`type: task`) are managed by the `workflow-lifecycle` skill.
-See `~/.claude/skills/workflow-lifecycle/SKILL.md` for the full lifecycle
-protocol (pause, resume, completion, recovery).
-
-Task memories live in `memory/tasks/` — separate from knowledge memories.
-The sync engine does not scan them (flat `memory/*.md` glob only).
-
-## Audit
-
-`sync-memory --audit` finds memory pairs sharing ≥2 tags and ≥1 heading
-entity. These are candidates for semantic review — the model should read
-both, compare for factual consistency, and report contradictions or
-confirm agreement.
-
-## Proactive Maintenance
-
-Memory not recalled despite relevance → check `tags`, `description`, and
-`context` cover the terms used. Fix gaps, re-run sync.
-
-Memory contradicts current knowledge → run `sync-memory --audit`, flag
-the contradiction, ask which version is authoritative.
+```
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py              # validate + rebuild INDEX + update hot list
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix        # + remove broken references
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix --dry-run  # preview broken refs
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --dry-run    # validate only, no writes
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --audit      # contradiction candidates
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --json       # output INDEX.json
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --hit <slug>   # record recall hit (run after grep + Read)
+python ~/.claude/skills/memory-lifecycle/scripts/remove-memory.py <slug>     # safe delete + ref cleanup
+```

@@ -4,7 +4,7 @@
 Idempotent installer that:
 1. Creates ~/.claude/global/memory/ directory if it doesn't exist
 2. Adds memory-index markers to ~/.claude/CLAUDE.md if not present
-3. Registers the PostToolUse hook in ~/.claude/settings.json
+3. Registers the PostToolUse hook (auto-sync on Write/Edit/MultiEdit of memory files)
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def _build_hook_entry() -> dict:
         command = f"'{sys.executable}' '{abs_path}'"
 
     return {
-        "matcher": "Write|Edit",
+        "matcher": "Write|Edit|MultiEdit",
         "pathPattern": "**/.claude/**/memory/*.md",
         "hooks": [
             {

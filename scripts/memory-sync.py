@@ -30,6 +30,7 @@ REQUIRED_FIELDS = {"name", "description"}
 KEBAB_PATTERN = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 WIKI_LINK_PATTERN = re.compile(r"\[\[([a-z][a-z0-9-]*)\]\]")
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+CJK_PATTERN = re.compile(r'[一-鿿㐀-䶿豈-﫿]')
 
 # ── Hot-List Constants ──────────────────────────────────────────────────────────
 
@@ -256,6 +257,20 @@ def validate(meta: dict, body: str, stored_hash: str,
             "detail": "all read-when phrases are very short (<10 chars), may match too broadly",
             "suggestion": "Use longer, more specific phrases like 'debugging tt statusline cost display'"
         })
+
+    # Check 7: CJK characters — all .md files must be English per CLAUDE.md
+    if full_text:
+        cjk_lines = []
+        for i, line in enumerate(full_text.split("\n"), start=1):
+            if CJK_PATTERN.search(line):
+                cjk_lines.append(f"L{i}: {line.strip()[:60]}")
+        if cjk_lines:
+            warnings.append({
+                "level": "error",
+                "check": "cjk-characters",
+                "detail": f"Chinese/CJK characters found at:\n    " + "\n    ".join(cjk_lines[:10]),
+                "suggestion": "Rewrite all content in English. All .md files must be English per CLAUDE.md"
+            })
 
     return warnings, actual_hash
 

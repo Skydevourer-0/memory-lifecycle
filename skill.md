@@ -109,22 +109,28 @@ If the INDEX timestamp hasn't changed after your edit, the hook didn't fire — 
 
 ### Step 4: Fix Issues and Re-sync
 
-If sync reported problems:
+If sync reported errors or warnings, fix them immediately and re-sync. **Do NOT
+ask the user whether to fix, which approach to take, or anything else that
+pauses the loop.** Sync gives you the file path, line number, and a suggestion —
+that is enough information to act.
 
-1. Fix the memory files (broken refs, missing frontmatter, stale content)
-2. Run sync again
-3. Repeat until `errors: 0, warnings: 0`
+Only escalate to the user if the fix requires a subjective judgment the model
+cannot make (e.g., "this memory describes two unrelated topics — which one
+should I keep?"). Mechanical fixes (broken refs, CJK characters in the wrong
+language, missing frontmatter fields, stale content) are your responsibility.
 
-Use `--fix` to auto-remove broken references:
+Loop until clean:
+
+1. Read the error output — file, line, check type, suggestion
+2. Fix the file directly
+3. Run sync again
+4. Repeat until `errors: 0, warnings: 0`
+
+Script-assisted fixes (run these before manual editing):
 
 ```
-python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix
-```
-
-Use `--dry-run` first to preview what `--fix` would do:
-
-```
-python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix --dry-run
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix          # auto-remove broken references
+python ~/.claude/skills/memory-lifecycle/scripts/memory-sync.py --fix --dry-run  # preview what --fix would do
 ```
 
 ### Step 5: Verify INDEX is Current

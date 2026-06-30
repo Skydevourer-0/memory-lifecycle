@@ -145,11 +145,20 @@ def cmd_hint(mem_dir, slug):
     rw = entry.get("read_when", [])
     refs = entry.get("references", [])
     desc = entry.get("description", "")
-    print("  Review:")
-    print(f"    description:  {'[empty]' if not desc.strip() else desc[:80]}")
-    print(f"    read_when:    {rw if rw else '[empty]'}")
-    print(f"    references:   {refs if refs else '[empty]'}")
-    print(f"  Next:  $SM --hint {slug}  # then $SM --set-metadata {slug} <<'EOF' ...")
+    print("  Status:")
+    if not desc.strip():
+        print(f"    description  ✗  required, min 20 chars")
+    else:
+        print(f"    description  (review)  {desc[:70]}")
+    if not rw:
+        print(f"    read_when    ✗  required, min 1 phrase, max 8")
+    else:
+        print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}")
+    if refs:
+        print(f"    references   (review)  {refs}")
+    else:
+        print(f"    references   [empty]  optional, max 10")
+    print(f"  Next:  $SM --set-metadata {slug} <<'EOF' ...")
     return 0
 
 

@@ -1,173 +1,77 @@
 #!/usr/bin/env python3
-"""install.py — Cross-platform installer for memory-lifecycle v2.
-
-Idempotent installer that:
-1. Creates ~/.claude/global/memory/ directory if it doesn't exist
-2. Adds memory-index markers to ~/.claude/CLAUDE.md if not present
-3. Registers the PostToolUse hook (auto-sync on Write/Edit/MultiEdit of memory files)
-"""
-
-from __future__ import annotations
+"""Install memory-lifecycle v2.1: create dirs, add hot-list markers, register hook."""
 
 import json
-import platform
+import os
 import sys
-from pathlib import Path
 
 
-def get_claude_dir() -> Path:
-    """Return the ~/.claude directory path."""
-    return Path.home() / ".claude"
+MEMORY_INDEX_START = "<!-- memory-index:start -->"
+MEMORY_INDEX_END = "<!-- memory-index:end -->"
 
 
-def get_skill_scripts_dir() -> Path:
-    """Return the directory where this install script lives (same dir as memory-sync.py)."""
-    return Path(__file__).resolve().parent
-
-
-def get_memory_sync_path() -> Path:
-    """Return the absolute path to memory-sync.py."""
-    return get_skill_scripts_dir() / "memory-sync.py"
-
-
-def step_create_memory_dir() -> bool:
-    """Create ~/.claude/global/memory/ if it doesn't exist. Returns True if created."""
-    memory_dir = get_claude_dir() / "global" / "memory"
-    if memory_dir.is_dir():
-        print(f"[OK] Directory already exists: {memory_dir}")
+def install_markers(filepath):
+    """Append markers to file if missing. Returns True if added."""
+    if not os.path.exists(filepath):
+        print(f"  SKIP: {filepath} not found")
         return False
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[CREATED] Directory: {memory_dir}")
+    with open(filepath, "r") as f:
+        content = f.read()
+    if MEMORY_INDEX_START in content and MEMORY_INDEX_END in content:
+        return False
+    with open(filepath, "a") as f:
+        f.write(f"\n{MEMORY_INDEX_START}\n{MEMORY_INDEX_END}\n")
     return True
 
 
-def step_add_memory_markers() -> bool:
-    """Add memory-index markers to CLAUDE.md if not present. Returns True if added."""
-    claude_md = get_claude_dir() / "CLAUDE.md"
-    start_marker = "<!-- memory-index:start -->"
-    end_marker = "<!-- memory-index:end -->"
+def register_hook():
+    """Register PostToolUse hook in ~/.claude/settings.json."""
+    settings_path = os.path.expanduser("~/.claude/settings.json")
+    if not os.path.exists(settings_path):
+        print("  SKIP: ~/.claude/settings.json not found, cannot register hook")
+        return
 
-    if not claude_md.is_file():
-        content = f"{start_marker}\n{end_marker}\n"
-        claude_md.write_text(content, encoding="utf-8")
-        print(f"[CREATED] {claude_md} with memory-index markers")
-        return True
+    with open(settings_path, "r") as f:
+        settings = json.load(f)
 
-    content = claude_md.read_text(encoding="utf-8")
-    if start_marker in content and end_marker in content:
-        print(f"[OK] Memory-index markers already present in {claude_md}")
-        return False
+    hooks = settings.setdefault("hooks", {})
+    post_hooks = hooks.setdefault("PostToolUse", [])
 
-    # Append markers at the end
-    if not content.endswith("\n"):
-        content += "\n"
-    content += f"{start_marker}\n{end_marker}\n"
-    claude_md.write_text(content, encoding="utf-8")
-    print(f"[ADDED] Memory-index markers to {claude_md}")
-    return True
+    hook_script = os.path.expanduser("~/.claude/skills/memory-lifecycle/scripts/memory-sync.py")
+    for h in post_hooks:
+        if "memory-sync" in h.get("command", "") or "memory-lifecycle" in h.get("command", ""):
+            print("  PostToolUse hook already registered.")
+            return
 
-
-def _build_hook_entry() -> dict:
-    """Build the PostToolUse hook entry for this platform."""
-    memory_sync = get_memory_sync_path()
-    abs_path = str(memory_sync)
-
-    if platform.system() == "Windows":
-        command = (
-            'powershell -NoProfile -ExecutionPolicy Bypass -Command '
-            f'"[Console]::OutputEncoding=[Text.Encoding]::UTF8; & \'{sys.executable}\' \'{abs_path}\'"'
-        )
-    else:
-        command = f"'{sys.executable}' '{abs_path}'"
-
-    return {
+    new_hook = {
         "matcher": "Write|Edit|MultiEdit",
         "pathPattern": "**/.claude/**/memory/*.md",
-        "hooks": [
-            {
-                "type": "command",
-                "command": command,
-                "async": False,
-            }
-        ],
+        "hooks": [{"type": "command", "command": f"python3 {hook_script} sync"}]
     }
+    post_hooks.append(new_hook)
 
-
-def _hook_already_registered(existing_hooks: list, new_hook: dict) -> bool:
-    """Check if an equivalent PostToolUse hook is already present.
-
-    Checks for matching matcher + pathPattern, and a hooks list whose
-    commands reference the memory-sync.py script.
-    """
-    for entry in existing_hooks:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("matcher") != new_hook["matcher"]:
-            continue
-        if entry.get("pathPattern") != new_hook["pathPattern"]:
-            continue
-        hooks_list = entry.get("hooks", [])
-        for h in hooks_list:
-            if not isinstance(h, dict):
-                continue
-            cmd = h.get("command", "")
-            if "memory-sync.py" in cmd and str(sys.executable) in cmd:
-                return True
-    return False
-
-
-def step_register_hook() -> bool:
-    """Register the PostToolUse hook in settings.json. Returns True if added."""
-    settings_path = get_claude_dir() / "settings.json"
-    new_hook = _build_hook_entry()
-
-    if settings_path.is_file():
-        try:
-            settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[ERROR] Failed to read {settings_path}: {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        settings = {}
-
-    # Ensure nested structure exists
-    if "hooks" not in settings:
-        settings["hooks"] = {}
-    if "PostToolUse" not in settings["hooks"]:
-        settings["hooks"]["PostToolUse"] = []
-
-    existing = settings["hooks"]["PostToolUse"]
-    if _hook_already_registered(existing, new_hook):
-        print(
-            f"[OK] PostToolUse hook for memory-sync already registered in {settings_path}"
-        )
-        return False
-
-    existing.append(new_hook)
-    settings_path.write_text(
-        json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print(f"[ADDED] PostToolUse hook to {settings_path}")
-    return True
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+    print("  PostToolUse hook registered.")
 
 
 def main():
-    print("=== memory-lifecycle Installer ===")
-    print(f"Platform: {platform.system()} ({platform.release()})")
-    print(f"Scripts directory: {get_skill_scripts_dir()}")
-    print(f"Memory-sync path:  {get_memory_sync_path()}")
-    print(f"Claude directory:  {get_claude_dir()}")
-    print()
+    print("Installing memory-lifecycle v2.1...")
 
-    step_create_memory_dir()
-    step_add_memory_markers()
-    step_register_hook()
+    global_mem = os.path.expanduser("~/.claude/global/memory")
+    os.makedirs(global_mem, exist_ok=True)
+    print(f"  Memory directory: {global_mem}")
 
-    print()
-    print("=== Installation complete ===")
-    print("Project-scope setup is automatic: sync creates MEMORY.md + markers on first run.")
+    claude_md = os.path.expanduser("~/.claude/CLAUDE.md")
+    if install_markers(claude_md):
+        print(f"  Added memory-index markers to {claude_md}")
+
+    register_hook()
+
+    print("\nInstallation complete.")
+    print("Project MEMORY.md markers will be added lazily on first sync-memory run.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

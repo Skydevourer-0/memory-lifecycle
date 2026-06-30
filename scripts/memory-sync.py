@@ -133,7 +133,7 @@ def cmd_hint(mem_dir, slug):
 
     print(f"Metadata hints for '{slug}':")
     if headings:
-        print("  Body headings (suggested read_when):")
+        print("  Body headings (candidates for read_when):")
         for h in headings:
             print(f"    ## {h}")
     print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10")
@@ -142,14 +142,14 @@ def cmd_hint(mem_dir, slug):
     if global_metadata:
         global_names = list(global_metadata.keys())
         print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]")
-    desc = entry.get("description", "")
     rw = entry.get("read_when", [])
     refs = entry.get("references", [])
-    print("  Status:")
-    print(f"    description  {'✓' if len(desc.strip()) >= 20 else '✗'}  {'ok' if len(desc.strip()) >= 20 else 'required, min 20 chars'}")
-    print(f"    read_when    {'✓' if rw else '✗'}  {'ok' if rw else 'required, min 1 phrase, max 8'}")
-    print(f"    references   {'✓' if refs else '○'}  {'ok' if refs else 'optional, max 10'}")
-    print(f"  Next:  sync-memory --set-metadata {slug} <<'EOF' ... EOF")
+    desc = entry.get("description", "")
+    print("  Review:")
+    print(f"    description:  {'[empty]' if not desc.strip() else desc[:80]}")
+    print(f"    read_when:    {rw if rw else '[empty]'}")
+    print(f"    references:   {refs if refs else '[empty]'}")
+    print(f"  Next:  $SM --hint {slug}  # then $SM --set-metadata {slug} <<'EOF' ...")
     return 0
 
 

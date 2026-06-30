@@ -210,8 +210,7 @@ def get_hot_list_target(scope, cwd=None):
     cwd = cwd or os.getcwd()
     git_root = _find_git_root(cwd)
     if git_root:
-        project_slug = re.sub(r"[^a-z0-9/-]", "-", git_root.lower()).replace("/", "-")
-        return os.path.expanduser(f"~/.claude/projects/{project_slug}/MEMORY.md")
+        return get_memory_dir(scope, cwd) + "/MEMORY.md"
     return os.path.expanduser("~/.claude/CLAUDE.md")
 
 

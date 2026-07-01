@@ -297,7 +297,7 @@ def main():
     sync_p.add_argument("--dry-run", action="store_true", help="Validate only, no writes")
     sync_p.add_argument("--scope-from-file", type=str, help="Pin scope from file path")
     hint_p = sub.add_parser("hint", help="Show metadata hints for a memory")
-    hint_p.add_argument("slug")
+    hint_p.add_argument("slug", nargs="?", help="Slug, or read from stdin (tool_input.file_path) when piped")
     set_p = sub.add_parser("set-metadata", help="Batch write metadata from stdin JSON")
     set_p.add_argument("slug")
     del_p = sub.add_parser("delete", help="Delete a memory and clean dangling refs")
@@ -311,7 +311,22 @@ def main():
         parser.print_help()
         return 1
 
-    mem_dir = get_mem_dir(scope_from_file=getattr(args, 'scope_from_file', None))
+    # PostToolUse hook pipes tool result JSON to stdin. Only sync/hint
+    # consume it (for scope + slug); set-metadata uses stdin for its own JSON.
+    hook_data = None
+    scope_file = getattr(args, 'scope_from_file', None)
+    if args.command in ("sync", "hint") and not sys.stdin.isatty() and not scope_file:
+        import select
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            try:
+                data = json.load(sys.stdin)
+                if data.get("hook_event_name"):
+                    hook_data = data
+                    scope_file = data.get("tool_input", {}).get("file_path", "")
+            except Exception:
+                pass
+
+    mem_dir = get_mem_dir(scope_from_file=scope_file) if scope_file else get_mem_dir()
     os.makedirs(mem_dir, exist_ok=True)
 
     dry_run = getattr(args, 'dry_run', False)
@@ -319,7 +334,14 @@ def main():
     if args.command == "sync":
         return cmd_sync(mem_dir, dry_run=dry_run, scope_from_file=args.scope_from_file)
     elif args.command == "hint":
-        return cmd_hint(mem_dir, args.slug)
+        slug = args.slug
+        if not slug and hook_data:
+            fp = hook_data.get("tool_input", {}).get("file_path", "")
+            slug = os.path.splitext(os.path.basename(fp))[0] if fp else ""
+        if not slug:
+            print("hint: no slug provided and no file_path in stdin", file=sys.stderr)
+            return 1
+        return cmd_hint(mem_dir, slug)
     elif args.command == "set-metadata":
         return cmd_set_metadata(mem_dir, args.slug)
     elif args.command == "delete":

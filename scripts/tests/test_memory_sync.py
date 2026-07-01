@@ -143,7 +143,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("Design", r.stdout)
         self.assertIn("Testing", r.stdout)
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import common as cm
         self._make_md("other-ref", "# Other\n\nReference target.")
         r = self._run("sync")
@@ -183,8 +183,145 @@ class TestEndToEnd(unittest.TestCase):
         }))
         self._run("delete", "b")
         jsonl_path = os.path.join(self.mem_dir, "metadata.jsonl")
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import common as cm2
         metadata = cm2.read_metadata(jsonl_path)
         self.assertNotIn("b", metadata)
         self.assertEqual(metadata["a"]["references"], [])
+
+
+class TestHintHookMode(unittest.TestCase):
+    """hint with PostToolUse stdin payload — verifies additionalContext injection."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mem_dir = os.path.join(self.tmp.name, "memory")
+        os.makedirs(self.mem_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_hook(self, file_path, slug_override=None):
+        """Run hint as if invoked by PostToolUse hook (stdin payload present)."""
+        env = os.environ.copy()
+        env["_MEMORY_SYNC_TEST_DIR"] = self.mem_dir
+        payload = json.dumps({
+            "hook_event_name": "PostToolUse",
+            "tool_input": {"file_path": file_path}
+        })
+        args = ["hint"]
+        if slug_override:
+            args.append(slug_override)
+        return subprocess.run(
+            [sys.executable, MEMORY_SYNC] + args,
+            capture_output=True, text=True, env=env, input=payload
+        )
+
+    def _make_md(self, slug, body="# Test"):
+        with open(os.path.join(self.mem_dir, f"{slug}.md"), "w") as f:
+            f.write(body)
+
+    def test_hook_skip_memory_md(self):
+        """MEMORY.md should be silently skipped (exit 0, no additionalContext)."""
+        self._make_md("MEMORY")
+        r = self._run_hook(os.path.join(self.mem_dir, "MEMORY.md"))
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", r.stdout)
+
+    def test_hook_skip_index_md(self):
+        """INDEX.md should be silently skipped."""
+        self._make_md("INDEX")
+        r = self._run_hook(os.path.join(self.mem_dir, "INDEX.md"))
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", r.stdout)
+
+    def test_hook_skip_readme_md(self):
+        """README.md should be silently skipped."""
+        self._make_md("README")
+        r = self._run_hook(os.path.join(self.mem_dir, "README.md"))
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", r.stdout)
+
+    def test_hook_file_not_found_exits_1(self):
+        """Non-existent slug in hook mode exits 1, no additionalContext (not stale, just missing)."""
+        r = self._run_hook("/nonexistent/memory/data-movement.md")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stderr)
+        # Not stale, just missing — no additionalContext
+        self.assertNotIn("hookSpecificOutput", r.stdout)
+
+    def test_hook_stale_metadata_injects_additional_context(self):
+        """Missing description + read_when → additionalContext + exit 1."""
+        self._make_md("my-topic", "## Design\n\nContent.")
+        path = os.path.join(self.mem_dir, "my-topic.md")
+        # sync to register stub
+        subprocess.run(
+            [sys.executable, MEMORY_SYNC, "sync"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir}
+        )
+        r = self._run_hook(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hookSpecificOutput", r.stdout)
+        out_json = json.loads(r.stdout.strip())
+        ctx = out_json["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Metadata stale", ctx)
+        self.assertIn("my-topic", ctx)
+
+    def test_hook_complete_metadata_exits_0(self):
+        """Fully populated metadata → exit 0, no additionalContext."""
+        self._make_md("done", "## Design\n\nContent.")
+        path = os.path.join(self.mem_dir, "done.md")
+        subprocess.run(
+            [sys.executable, MEMORY_SYNC, "sync"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir}
+        )
+        subprocess.run(
+            [sys.executable, MEMORY_SYNC, "set-metadata", "done"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir},
+            input=json.dumps({
+                "description": "Complete memory with full metadata for testing purposes.",
+                "read_when": ["hook testing", "verification"],
+                "references": []
+            })
+        )
+        r = self._run_hook(path)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", r.stdout)
+
+    def test_manual_hint_stale_exits_0(self):
+        """Manual mode with stale metadata exits 0 (model reads stdout)."""
+        self._make_md("stale", "## Design")
+        subprocess.run(
+            [sys.executable, MEMORY_SYNC, "sync"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir}
+        )
+        r = subprocess.run(
+            [sys.executable, MEMORY_SYNC, "hint", "stale"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir}
+        )
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("required", r.stdout)
+
+    def test_sync_and_hint_stale_injects_additional_context(self):
+        """Deprecated sync-and-hint: stale metadata → additionalContext + exit 1."""
+        self._make_md("dep-topic", "## Deprecated\n\nTest.")
+        path = os.path.join(self.mem_dir, "dep-topic.md")
+        payload = json.dumps({
+            "hook_event_name": "PostToolUse",
+            "tool_input": {"file_path": path}
+        })
+        r = subprocess.run(
+            [sys.executable, MEMORY_SYNC, "sync-and-hint"],
+            capture_output=True, text=True,
+            env={**os.environ, "_MEMORY_SYNC_TEST_DIR": self.mem_dir},
+            input=payload
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hookSpecificOutput", r.stdout)
+
+

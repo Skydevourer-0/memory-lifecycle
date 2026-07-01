@@ -12,15 +12,28 @@ import common
 
 
 def get_mem_dir(scope_from_file=None):
-    """Resolve memory directory. Test override -> scope-from-file -> CWD detection."""
+    """Resolve memory directory. Test override -> scope-from-file -> CWD detection.
+    When scope_from_file is given, derive mem_dir directly from the file path
+    (the file already lives under the correct memory dir, no need for git discovery)."""
     test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
     if test_dir:
         return test_dir
     if scope_from_file:
-        scope = common.detect_scope_from_file(scope_from_file)
-    else:
-        scope = common.detect_scope()
-    return common.get_memory_dir(scope, cwd=os.path.dirname(scope_from_file) if scope_from_file else None)
+        expanded = os.path.expanduser(scope_from_file)
+        project_prefix = os.path.expanduser("~/.claude/projects/")
+        global_mem = os.path.expanduser("~/.claude/global/memory")
+        if expanded.startswith(global_mem):
+            return global_mem
+        if expanded.startswith(project_prefix):
+            # Extract ~/.claude/projects/<slug>/memory from the file path
+            rel = expanded[len(project_prefix):]
+            parts = rel.split(os.sep, 1)
+            if parts:
+                slug = parts[0]
+                return os.path.join(project_prefix, slug, "memory")
+        # Fallback: scope detection from CWD
+        return common.get_memory_dir("project", cwd=os.path.dirname(expanded))
+    return common.get_memory_dir(common.detect_scope())
 
 
 def get_jsonl_path(mem_dir):
@@ -102,22 +115,32 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
 
     print(f"INDEX.md written ({len(metadata)} memories)")
     if new_stubs:
-        print(f"{new_stubs} new memories awaiting metadata. Run sync-memory --hint <slug> for each.")
+        print(f"{new_stubs} new memories awaiting metadata. Run $SM hint <slug> for each.")
     return 0
 
 
-def cmd_hint(mem_dir, slug):
+def cmd_hint(mem_dir, slug, hook_mode=False):
+    """Return (exit_code, needs_review). needs_review=True when required metadata
+    fields (description, read_when) are missing or likely stale.
+
+    In hook_mode: diagnostic text goes to stderr (user-visible via UI notification),
+    not stdout — only the additionalContext JSON should land on stdout.
+    In manual mode: everything goes to stdout so the model can read it."""
+    out = sys.stderr if hook_mode else sys.stdout
+    if slug in ("INDEX", "MEMORY", "README"):
+        return 0, False  # silent skip for hot-list and infrastructure files
     md_path = os.path.join(mem_dir, f"{slug}.md")
     if not os.path.exists(md_path):
         print(f"{slug}: file not found", file=sys.stderr)
-        return 1
+        return 1, False
 
     jsonl_path = get_jsonl_path(mem_dir)
     metadata = common.read_metadata(jsonl_path)
 
     if slug not in metadata:
-        print(f"{slug}: not yet registered in metadata. Run sync-memory first, then --hint again.")
-        return 1
+        print(f"{slug}: not yet registered in metadata. Run sync-memory sync first, then hint again.",
+              file=out)
+        return 1, False
 
     with open(md_path, "r") as f:
         body = f.read()
@@ -131,35 +154,38 @@ def cmd_hint(mem_dir, slug):
     if os.path.exists(global_mem_dir) and mem_dir != global_mem_dir:
         global_metadata = common.read_metadata(os.path.join(global_mem_dir, "metadata.jsonl"))
 
-    print(f"Metadata hints for '{slug}':")
+    print(f"Metadata hints for '{slug}':", file=out)
     if headings:
-        print("  Body headings (candidates for read_when):")
+        print("  Body headings (candidates for read_when):", file=out)
         for h in headings:
-            print(f"    ## {h}")
-    print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10")
+            print(f"    ## {h}", file=out)
+    print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10", file=out)
     if current_slugs:
-        print(f"  Available slugs (current scope):  [{', '.join(current_slugs)}]")
+        print(f"  Available slugs (current scope):  [{', '.join(current_slugs)}]", file=out)
     if global_metadata:
         global_names = list(global_metadata.keys())
-        print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]")
+        print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]", file=out)
     rw = entry.get("read_when", [])
     refs = entry.get("references", [])
     desc = entry.get("description", "")
-    print("  Status:")
+    needs_review = False
+    print("  Status:", file=out)
     if not desc.strip():
-        print(f"    description  ✗  required, min 20 chars")
+        print(f"    description  ✗  required, min 20 chars", file=out)
+        needs_review = True
     else:
-        print(f"    description  (review)  {desc[:70]}")
+        print(f"    description  (review)  {desc[:70]}", file=out)
     if not rw:
-        print(f"    read_when    ✗  required, min 1 phrase, max 8")
+        print(f"    read_when    ✗  required, min 1 phrase, max 8", file=out)
+        needs_review = True
     else:
-        print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}")
+        print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}", file=out)
     if refs:
-        print(f"    references   (review)  {refs}")
+        print(f"    references   (review)  {refs}", file=out)
     else:
-        print(f"    references   [empty]  optional, max 10")
-    print(f"  Next:  $SM --set-metadata {slug} <<'EOF' ...")
-    return 0
+        print(f"    references   [empty]  optional, max 10", file=out)
+    print(f"  Next:  $SM set-metadata {slug} <<'EOF' ...", file=out)
+    return 0, needs_review
 
 
 def cmd_set_metadata(mem_dir, slug):
@@ -167,7 +193,7 @@ def cmd_set_metadata(mem_dir, slug):
     metadata = common.read_metadata(jsonl_path)
 
     if slug not in metadata:
-        print(f"{slug}: no metadata entry. Run sync-memory first.", file=sys.stderr)
+        print(f"{slug}: no metadata entry. Run sync-memory sync first.", file=sys.stderr)
         return 1
 
     try:
@@ -296,8 +322,9 @@ def main():
     sync_p = sub.add_parser("sync", help="Full sync: scan .md, update metadata, rebuild INDEX, update hot list")
     sync_p.add_argument("--dry-run", action="store_true", help="Validate only, no writes")
     sync_p.add_argument("--scope-from-file", type=str, help="Pin scope from file path")
+    sub.add_parser("sync-and-hint", help="DEPRECATED: use sync + hint as separate hooks")
     hint_p = sub.add_parser("hint", help="Show metadata hints for a memory")
-    hint_p.add_argument("slug", nargs="?", help="Slug, or read from stdin (tool_input.file_path) when piped")
+    hint_p.add_argument("slug", nargs="?", help="Memory slug")
     set_p = sub.add_parser("set-metadata", help="Batch write metadata from stdin JSON")
     set_p.add_argument("slug")
     del_p = sub.add_parser("delete", help="Delete a memory and clean dangling refs")
@@ -311,11 +338,11 @@ def main():
         parser.print_help()
         return 1
 
-    # PostToolUse hook pipes tool result JSON to stdin. Only sync/hint
-    # consume it (for scope + slug); set-metadata uses stdin for its own JSON.
+    # PostToolUse hook pipes tool result JSON to stdin. sync and hint both
+    # consume it (for scope + slug). Each hook gets its own independent pipe.
     hook_data = None
     scope_file = getattr(args, 'scope_from_file', None)
-    if args.command in ("sync", "hint") and not sys.stdin.isatty() and not scope_file:
+    if args.command in ("sync", "hint", "sync-and-hint") and not sys.stdin.isatty() and not scope_file:
         import select
         if select.select([sys.stdin], [], [], 0.1)[0]:
             try:
@@ -333,15 +360,53 @@ def main():
 
     if args.command == "sync":
         return cmd_sync(mem_dir, dry_run=dry_run, scope_from_file=args.scope_from_file)
-    elif args.command == "hint":
-        slug = args.slug
-        if not slug and hook_data:
-            fp = hook_data.get("tool_input", {}).get("file_path", "")
-            slug = os.path.splitext(os.path.basename(fp))[0] if fp else ""
-        if not slug:
-            print("hint: no slug provided and no file_path in stdin", file=sys.stderr)
+    elif args.command == "sync-and-hint":
+        # DEPRECATED — kept for compatibility only, use sync + hint hooks instead.
+        ret = cmd_sync(mem_dir, dry_run=dry_run, scope_from_file=scope_file)
+        if ret != 0:
+            return ret
+        if not scope_file:
+            return 0
+        slug = os.path.splitext(os.path.basename(scope_file))[0]
+        _ec, needs_review = cmd_hint(mem_dir, slug, hook_mode=True)
+        if needs_review:
+            ctx = (f"Metadata stale for '{slug}'. "
+                   f"Run $SM set-metadata {slug} to update read_when / description.")
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": f"⚠️ {ctx}"
+                }
+            }))
             return 1
-        return cmd_hint(mem_dir, slug)
+        return 0
+    elif args.command == "hint":
+        # From hook: stdin has file_path; from CLI: args.slug.
+        fp = args.slug
+        if not fp and hook_data:
+            fp = hook_data.get("tool_input", {}).get("file_path", "")
+        if not fp:
+            print("hint: no file path. Run $SM hint <slug>.", file=sys.stderr)
+            return 1
+
+        slug = os.path.splitext(os.path.basename(fp))[0]
+        exit_code, needs_review = cmd_hint(mem_dir, slug, hook_mode=bool(hook_data))
+
+        if hook_data:
+            if needs_review:
+                ctx = (f"Metadata stale for '{slug}'. "
+                       f"Run $SM set-metadata {slug} to update read_when / description.")
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": f"⚠️ {ctx}"
+                    }
+                }))
+                return 1
+            return 0 if exit_code == 0 else 1
+        # Manual mode: actual errors (file not found, not in metadata) still
+        # exit non-zero; needs_review is suppressed so model can read stdout.
+        return exit_code
     elif args.command == "set-metadata":
         return cmd_set_metadata(mem_dir, args.slug)
     elif args.command == "delete":

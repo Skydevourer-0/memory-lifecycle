@@ -23,7 +23,8 @@ e.g. `/home/user/code/my-project` → `-home-user-code-my-project` →
 memories at `~/.claude/projects/-home-user-code-my-project/memory/`,
 hot list at `~/.claude/projects/-home-user-code-my-project/memory/MEMORY.md` (CC auto-loads).
 
-Scope auto-detect: walk upward from CWD to `.git` → project; no `.git` → global.
+Scope auto-detect: walk upward from CWD to `.git` → project. Paths under `~/.claude/`
+are always global (covers skill development, configs, etc.). No `.git` found → global.
 
 ## Recall
 
@@ -40,17 +41,16 @@ Pure Markdown. No YAML frontmatter. Use `##` / `###` headings.
 
 MUST use `Write` / `Edit` / `MultiEdit` tools (not shell commands) so the PostToolUse hook fires.
 
-### 2. Sync
+### 2. Sync & Hint
 
-Hook auto-runs `$SM sync`. Check output for `INDEX.md written`. If absent, run `$SM sync` manually.
-
-After body edits, run `$SM --hint <slug>` to review headings. Decide whether new headings
-warrant updating `read_when` — not every heading needs a trigger phrase.
-
-New files get a stub:
+PostToolUse hook auto-runs `$SM sync` then `$SM hint` (slug extracted from stdin
+`tool_input.file_path`). The hint shows headings and metadata status; model decides
+whether to update `read_when`. New files get a stub:
 ```
-1 new memories awaiting metadata. Run $SM --hint <slug> for each.
+1 new memories awaiting metadata.
 ```
+
+Manual use: `$SM hint <slug>` — shows headings, refs, slugs, required fields.
 
 ### 3. Set metadata
 
@@ -96,9 +96,8 @@ Run ONLY when user explicitly asks to review, organize, clean up, or audit the m
 
 ```
 $SM sync                            # full sync
-$SM --hint <slug>                   # metadata hints
-$SM --set-metadata <slug> <<'EOF'    # batch write metadata (stdin JSON)
-$SM --delete <slug>                 # delete + cleanup
-$SM --dry-run                       # read-only validate
-$SM --audit                         # structural audit
+$SM hint [slug]                     # metadata hints (slug optional: reads from stdin in hook)
+$SM set-metadata <slug> <<'EOF'     # batch write metadata (stdin JSON)
+$SM delete <slug>                   # delete + cleanup
+$SM audit                           # structural audit
 ```

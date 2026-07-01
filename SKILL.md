@@ -43,9 +43,20 @@ MUST use `Write` / `Edit` / `MultiEdit` tools (not shell commands) so the PostTo
 
 ### 2. Sync & Hint
 
-PostToolUse hook auto-runs `$SM sync` then `$SM hint` (slug extracted from stdin
-`tool_input.file_path`). The hint shows headings and metadata status; model decides
-whether to update `read_when`. New files get a stub:
+PostToolUse hook runs TWO separate commands: `$SM sync` then `$SM hint`.
+Each gets its own independent stdin pipe with the tool-result JSON payload.
+Sync rebuilds the index; hint extracts the slug from stdin and checks metadata
+completeness. MEMORY.md, INDEX.md, and README.md are silently skipped.
+
+When hint detects missing or stale metadata (description, read_when), it
+injects an `additionalContext` message into your next turn:
+```
+⚠️ Metadata stale for 'data-movement'. Run $SM set-metadata data-movement ...
+```
+You MUST respond by running `$SM set-metadata <slug>` with updated
+description, read_when, and references. Do not ignore stale-metadata warnings.
+
+New files get a stub:
 ```
 1 new memories awaiting metadata.
 ```
@@ -55,8 +66,8 @@ Manual use: `$SM hint <slug>` — shows headings, refs, slugs, required fields.
 ### 3. Set metadata
 
 ```
-$SM --hint <slug>          # shows headings, refs, slugs, required fields
-$SM --set-metadata <slug> <<'EOF'
+$SM hint <slug>            # shows headings, refs, slugs, required fields
+$SM set-metadata <slug> <<'EOF'
 {
   "description": "...",
   "read_when": ["...", "..."],
@@ -77,27 +88,35 @@ description/read_when is REJECTED. Failure writes nothing; success auto-runs syn
 ## Remove
 
 ```
-$SM --delete <slug>           # delete .md + clean dangling refs + rebuild
-$SM --delete <slug> --dry-run # preview only
+$SM delete <slug>           # delete .md + clean dangling refs + rebuild
+$SM delete <slug> --dry-run # preview only
 ```
 
 ## Setup
 
 Once: `python3 $HOME/.claude/skills/memory-lifecycle/scripts/install.py`
 
+Registers TWO PostToolUse hooks in `~/.claude/settings.json`:
+- `$SM sync` — rebuilds INDEX.md and hot-list from .md files
+- `$SM hint` — checks metadata freshness, injects `additionalContext` when stale
+
+Creates `~/.claude/global/memory/`. Adds memory-index markers to `~/.claude/CLAUDE.md`.
+Project MEMORY.md markers are added lazily on first sync.
+
 ## Audit
 
-`$SM --audit` — structural graph audit (orphans, one-way edges). No semantic judgment.
+`$SM audit` — structural graph audit (orphans, one-way edges). No semantic judgment.
 
-MUST NOT run `--audit` during normal writes, syncs, or recalls.
+MUST NOT run `audit` during normal writes, syncs, or recalls.
 Run ONLY when user explicitly asks to review, organize, clean up, or audit the memory graph.
 
 ## Commands
 
 ```
 $SM sync                            # full sync
-$SM hint [slug]                     # metadata hints (slug optional: reads from stdin in hook)
+$SM hint [slug]                     # metadata hints (hook: slug from stdin; manual: slug from CLI arg)
 $SM set-metadata <slug> <<'EOF'     # batch write metadata (stdin JSON)
 $SM delete <slug>                   # delete + cleanup
 $SM audit                           # structural audit
+$SM sync-and-hint                   # DEPRECATED — use sync + hint as separate hooks
 ```

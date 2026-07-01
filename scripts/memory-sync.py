@@ -11,6 +11,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 
 
+def _is_under_memory_dir(filepath):
+    """Return True if filepath lives under a known memory directory.
+    Guards against pathPattern mismatches in the hook system — when the hook
+    fires for non-memory files, the script should silently exit 0."""
+    expanded = os.path.abspath(os.path.expanduser(filepath))
+    global_mem = os.path.abspath(os.path.expanduser("~/.claude/global/memory"))
+    projects_dir = os.path.abspath(os.path.expanduser("~/.claude/projects"))
+    if expanded.startswith(global_mem + os.sep):
+        return True
+    if expanded.startswith(projects_dir + os.sep):
+        # Expected: <project-slug>/memory/<file>.md
+        rel = expanded[len(projects_dir + os.sep):]
+        parts = rel.split(os.sep)
+        if len(parts) >= 2 and parts[1] == "memory":
+            return True
+    return False
+
+
 def get_mem_dir(scope_from_file=None):
     """Resolve memory directory. Test override -> scope-from-file -> CWD detection.
     When scope_from_file is given, derive mem_dir directly from the file path
@@ -352,6 +370,11 @@ def main():
                     scope_file = data.get("tool_input", {}).get("file_path", "")
             except Exception:
                 pass
+
+    # Guard: if the hook fired for a non-memory file (pathPattern mismatch in
+    # the hook system), silently exit 0 to avoid spurious "file not found" errors.
+    if hook_data and scope_file and not _is_under_memory_dir(scope_file):
+        return 0
 
     mem_dir = get_mem_dir(scope_from_file=scope_file) if scope_file else get_mem_dir()
     os.makedirs(mem_dir, exist_ok=True)

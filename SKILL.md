@@ -45,21 +45,21 @@ MUST use `Write` / `Edit` / `MultiEdit` tools (not shell commands) so the PostTo
 
 PostToolUse hook runs TWO separate commands: `$SM sync` then `$SM hint`.
 Each gets its own independent stdin pipe with the tool-result JSON payload.
-Sync rebuilds the index; hint extracts the slug from stdin and checks metadata
-completeness. MEMORY.md, INDEX.md, and README.md are silently skipped.
+Sync rebuilds the index; hint extracts the slug from stdin and always emits an
+`additionalContext` for every Write/Edit to a memory `.md` file (MEMORY.md,
+INDEX.md, and README.md are silently skipped). The review prompt fires
+unconditionally — metadata may be outdated even when no required fields are
+missing.
 
-When hint detects missing or stale metadata (description, read_when), it
-injects an `additionalContext` message into your next turn:
 ```
-⚠️ Metadata stale for 'data-movement'. Run $SM set-metadata data-movement ...
+🔴 MEMORY METADATA REVIEW NEEDED for '<slug>' 🔴
+You just wrote to this memory file. Its metadata (description,
+read_when, references) may not reflect the latest content.
+Run: $SM set-metadata <slug> <<'EOF' ...
 ```
+
 You MUST respond by running `$SM set-metadata <slug>` with updated
-description, read_when, and references. Do not ignore stale-metadata warnings.
-
-New files get a stub:
-```
-1 new memories awaiting metadata.
-```
+description, read_when, and references. Do not ignore this prompt.
 
 Manual use: `$SM hint <slug>` — shows headings, refs, slugs, required fields.
 

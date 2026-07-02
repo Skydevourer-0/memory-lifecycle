@@ -138,19 +138,17 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
 
 
 def cmd_hint(mem_dir, slug, hook_mode=False):
-    """Return (exit_code, needs_review). needs_review=True when required metadata
-    fields (description, read_when) are missing or likely stale.
-
-    In hook_mode: diagnostic text goes to stderr (user-visible via UI notification),
-    not stdout — only the additionalContext JSON should land on stdout.
-    In manual mode: everything goes to stdout so the model can read it."""
+    """Show metadata hints for a memory file. In hook_mode, diagnostic text
+    goes to stderr so stdout is reserved for additionalContext JSON (the
+    caller always emits additionalContext in hook mode — no needs_review
+    return needed). In manual mode, everything goes to stdout."""
     out = sys.stderr if hook_mode else sys.stdout
     if slug in ("INDEX", "MEMORY", "README"):
-        return 0, False  # silent skip for hot-list and infrastructure files
+        return 0  # silent skip for hot-list and infrastructure files
     md_path = os.path.join(mem_dir, f"{slug}.md")
     if not os.path.exists(md_path):
         print(f"{slug}: file not found", file=sys.stderr)
-        return 1, False
+        return 1
 
     jsonl_path = get_jsonl_path(mem_dir)
     metadata = common.read_metadata(jsonl_path)
@@ -158,7 +156,7 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
     if slug not in metadata:
         print(f"{slug}: not yet registered in metadata. Run sync-memory sync first, then hint again.",
               file=out)
-        return 1, False
+        return 1
 
     with open(md_path, "r") as f:
         body = f.read()
@@ -186,16 +184,13 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
     rw = entry.get("read_when", [])
     refs = entry.get("references", [])
     desc = entry.get("description", "")
-    needs_review = False
     print("  Status:", file=out)
     if not desc.strip():
         print(f"    description  ✗  required, min 20 chars", file=out)
-        needs_review = True
     else:
         print(f"    description  (review)  {desc[:70]}", file=out)
     if not rw:
         print(f"    read_when    ✗  required, min 1 phrase, max 8", file=out)
-        needs_review = True
     else:
         print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}", file=out)
     if refs:
@@ -203,7 +198,7 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
     else:
         print(f"    references   [empty]  optional, max 10", file=out)
     print(f"  Next:  $SM set-metadata {slug} <<'EOF' ...", file=out)
-    return 0, needs_review
+    return 0
 
 
 def cmd_set_metadata(mem_dir, slug):
@@ -391,18 +386,19 @@ def main():
         if not scope_file:
             return 0
         slug = os.path.splitext(os.path.basename(scope_file))[0]
-        _ec, needs_review = cmd_hint(mem_dir, slug, hook_mode=True)
-        if needs_review:
-            ctx = (f"Metadata stale for '{slug}'. "
-                   f"Run $SM set-metadata {slug} to update read_when / description.")
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": f"⚠️ {ctx}"
-                }
-            }))
-            return 1
-        return 0
+        cmd_hint(mem_dir, slug, hook_mode=True)
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": (
+                    f"🔴 MEMORY METADATA REVIEW NEEDED for '{slug}' 🔴\n"
+                    f"You just wrote to this memory file. Its metadata (description, "
+                    f"read_when, references) may not reflect the latest content.\n"
+                    f"Run: $SM set-metadata {slug} <<'EOF' ..."
+                )
+            }
+        }))
+        return 1
     elif args.command == "hint":
         # From hook: stdin has file_path; from CLI: args.slug.
         fp = args.slug
@@ -413,23 +409,23 @@ def main():
             return 1
 
         slug = os.path.splitext(os.path.basename(fp))[0]
-        exit_code, needs_review = cmd_hint(mem_dir, slug, hook_mode=bool(hook_data))
+        cmd_hint(mem_dir, slug, hook_mode=bool(hook_data))
 
         if hook_data:
-            if needs_review:
-                ctx = (f"Metadata stale for '{slug}'. "
-                       f"Run $SM set-metadata {slug} to update read_when / description.")
-                print(json.dumps({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": f"⚠️ {ctx}"
-                    }
-                }))
-                return 1
-            return 0 if exit_code == 0 else 1
-        # Manual mode: actual errors (file not found, not in metadata) still
-        # exit non-zero; needs_review is suppressed so model can read stdout.
-        return exit_code
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": (
+                        f"🔴 MEMORY METADATA REVIEW NEEDED for '{slug}' 🔴\n"
+                        f"You just wrote to this memory file. Its metadata (description, "
+                        f"read_when, references) may not reflect the latest content.\n"
+                        f"Run: $SM set-metadata {slug} <<'EOF' ..."
+                    )
+                }
+            }))
+            return 1
+        # Manual mode: actual errors (file not found, not in metadata)
+        return 0
     elif args.command == "set-metadata":
         return cmd_set_metadata(mem_dir, args.slug)
     elif args.command == "delete":

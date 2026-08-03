@@ -98,7 +98,7 @@ Once: `python3 $HOME/.claude/skills/memory-lifecycle/scripts/install.py`
 
 Registers TWO PostToolUse hooks in `~/.claude/settings.json`:
 - `$SM sync` — rebuilds INDEX.md and hot-list from .md files
-- `$SM hint` — checks metadata freshness, injects `additionalContext` when stale
+- `$SM hint` — injects `additionalContext` after every memory Write/Edit
 
 Creates `~/.claude/global/memory/`. Adds memory-index markers to `~/.claude/CLAUDE.md`.
 Project MEMORY.md markers are added lazily on first sync.

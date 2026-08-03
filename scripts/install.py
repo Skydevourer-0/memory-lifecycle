@@ -78,11 +78,12 @@ def register_hook():
         return
 
     added = []
+    python_exe = sys.executable
     if "sync" not in existing_commands:
-        target_block["hooks"].append({"type": "command", "command": f"python3 {hook_script} sync"})
+        target_block["hooks"].append({"type": "command", "command": f'"{python_exe}" "{hook_script}" sync'})
         added.append("sync")
     if "hint" not in existing_commands:
-        target_block["hooks"].append({"type": "command", "command": f"python3 {hook_script} hint"})
+        target_block["hooks"].append({"type": "command", "command": f'"{python_exe}" "{hook_script}" hint'})
         added.append("hint")
 
     with open(settings_path, "w") as f:

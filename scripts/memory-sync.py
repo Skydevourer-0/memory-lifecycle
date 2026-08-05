@@ -328,6 +328,88 @@ def cmd_audit(mem_dir):
     return 0
 
 
+def _display_graph(mem_dir, metadata, emit, no_mermaid=False):
+    """Placeholder — Task 2 fills this in."""
+    emit("# 视图待实现: graph")
+    return 0
+
+
+def _display_stats(mem_dir, metadata, emit):
+    """Placeholder — Task 3 fills this in."""
+    emit("# 视图待实现: stats")
+    return 0
+
+
+def _display_timeline(mem_dir, metadata, emit, no_mermaid=False):
+    """Placeholder — Task 4 fills this in."""
+    emit("# 视图待实现: timeline")
+    return 0
+
+
+def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):
+    """Placeholder — Task 5 fills this in."""
+    emit("# 视图待实现: usage")
+    return 0
+
+
+def cmd_display(mem_dir, args):
+    """Read-only: output Markdown + Mermaid visualization for Feishu docs.
+    Never writes to disk; never triggers sync; never touches the hot list."""
+    views = args.view.split(",") if args.view != "all" else ["graph", "stats", "timeline", "usage"]
+    exclude_set = set(args.exclude.split(",")) if args.exclude else set()
+    out = sys.stdout
+    if args.out:
+        parent = os.path.dirname(os.path.abspath(args.out))
+        os.makedirs(parent, exist_ok=True)
+        out = open(args.out, "w", encoding="utf-8")
+
+    def emit(text=""):
+        print(text, file=out)
+
+    jsonl_path = get_jsonl_path(mem_dir)
+    metadata = common.read_metadata(jsonl_path)  # {} if missing
+
+    # exclude 过滤:剔除 slug + 剔除指向被排除 slug 的边(避免悬空边)
+    for slug in list(exclude_set):
+        if slug not in metadata:
+            print(f"WARNING: exclude slug '{slug}' not found, ignored", file=sys.stderr)
+    for slug in exclude_set:
+        metadata.pop(slug, None)
+    for name, entry in metadata.items():
+        entry["references"] = [
+            r for r in entry.get("references", [])
+            if r.replace("global:", "", 1) not in exclude_set
+        ]
+
+    # 防御:拒绝自引用(metadata 校验已禁止,但脏数据时跳过)
+    for name, entry in metadata.items():
+        entry["references"] = [r for r in entry.get("references", []) if r.replace("global:", "", 1) != name]
+
+    if not metadata:
+        # 空库或全部被 exclude 排空 → 空状态占位
+        emit("## 知识图谱\n\n> 记忆库为空,暂无节点与引用。先运行 $SM sync 初始化。\n")
+        emit("## 全景统计\n\n| 指标 | 数值 |\n|------|------|\n| 记忆总数 | 0 |\n| 引用边总数 | 0 |\n")
+        emit("## 积累时间线\n\n> 记忆库为空,暂无时间线数据。\n")
+        emit("## 使用效果流\n\n> 记忆库为空。写入第一条记忆后重新运行 display 查看效果。")
+        if args.out:
+            out.close()
+        return 0
+
+    for view in views:
+        if view == "graph":
+            _display_graph(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+        elif view == "stats":
+            _display_stats(mem_dir, metadata, emit)
+        elif view == "timeline":
+            _display_timeline(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+        elif view == "usage":
+            _display_usage(mem_dir, metadata, emit, no_mermaid=args.no_mermaid, args=args)
+
+    if args.out:
+        out.close()
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="sync-memory", description="Memory lifecycle sync engine v2.1")
     sub = parser.add_subparsers(dest="command")
@@ -345,6 +427,14 @@ def main():
     del_p.add_argument("--dry-run", action="store_true", help="Validate only, no writes")
     del_p.add_argument("--scope-from-file", type=str, help="Pin scope from file path")
     sub.add_parser("audit", help="Structural audit of the memory graph")
+    disp_p = sub.add_parser("display", help="Read-only: output Feishu-pasteable visualization (graph/stats/timeline/usage)")
+    disp_p.add_argument("--view", default="all", choices=["graph", "stats", "timeline", "usage", "all"],
+                        help="View to output (default: all)")
+    disp_p.add_argument("--scope", default="auto", choices=["global", "project", "auto"],
+                        help="Memory scope (default: auto-detect)")
+    disp_p.add_argument("--exclude", default="", help="Comma-separated slugs to filter out")
+    disp_p.add_argument("--out", default="", help="Write output to file (default: stdout)")
+    disp_p.add_argument("--no-mermaid", action="store_true", help="Degrade mermaid blocks to markdown tables")
     args = parser.parse_args()
 
     if not args.command:
@@ -432,6 +522,8 @@ def main():
         return cmd_delete(mem_dir, args.slug, dry_run=dry_run, scope_from_file=args.scope_from_file)
     elif args.command == "audit":
         return cmd_audit(mem_dir)
+    elif args.command == "display":
+        return cmd_display(mem_dir, args)
     return 0
 
 

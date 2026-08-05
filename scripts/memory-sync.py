@@ -355,6 +355,9 @@ def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):
 def cmd_display(mem_dir, args):
     """Read-only: output Markdown + Mermaid visualization for Feishu docs.
     Never writes to disk; never triggers sync; never touches the hot list."""
+    if not os.path.isdir(mem_dir):
+        print(f"ERROR: memory dir not found: {mem_dir}", file=sys.stderr)
+        return 2
     views = args.view.split(",") if args.view != "all" else ["graph", "stats", "timeline", "usage"]
     exclude_set = set(args.exclude.split(",")) if args.exclude else set()
     out = sys.stdout
@@ -466,7 +469,8 @@ def main():
         return 0
 
     mem_dir = get_mem_dir(scope_from_file=scope_file) if scope_file else get_mem_dir()
-    os.makedirs(mem_dir, exist_ok=True)
+    if args.command != "display":
+        os.makedirs(mem_dir, exist_ok=True)
 
     dry_run = getattr(args, 'dry_run', False)
 

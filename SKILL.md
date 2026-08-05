@@ -118,5 +118,8 @@ $SM hint [slug]                     # metadata hints (hook: slug from stdin; man
 $SM set-metadata <slug> <<'EOF'     # batch write metadata (stdin JSON)
 $SM delete <slug>                   # delete + cleanup
 $SM audit                           # structural audit
+$SM display [--view graph|stats|timeline|usage|all] [--scope global|project|auto]
+            [--exclude slug1,slug2] [--out <file>] [--no-mermaid]
+            # read-only: emit paste-into-Feishu visual artifacts (knowledge graph / stats / timeline / usage)
 $SM sync-and-hint                   # DEPRECATED — use sync + hint as separate hooks
 ```

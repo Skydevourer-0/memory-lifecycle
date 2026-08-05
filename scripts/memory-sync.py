@@ -375,9 +375,74 @@ def _graph_as_table(metadata, in_degree, emit):
 
 
 def _display_stats(mem_dir, metadata, emit):
-    """Placeholder — Task 3 fills this in."""
-    emit("# 视图待实现: stats")
-    return 0
+    """Overview stats view: markdown table of counts + Top 5 hot list."""
+    scores, in_degree = common.compute_scores(metadata)
+    total = len(metadata)
+    with_refs = [e for e in metadata.values() if e.get("references")]
+    edges = sum(len(e.get("references", [])) for e in metadata.values())
+    cross = sum(1 for e in metadata.values() for r in e.get("references", []) if r.startswith("global:"))
+    hubs = sorted((n for n, d in in_degree.items() if d >= 3), key=lambda n: n)
+    avg = f"{edges / total:.2f}" if total else "0.00"
+    isolates = [n for n, e in metadata.items() if in_degree.get(n, 0) == 0 and not e.get("references")]
+    bidir = set()
+    for a in metadata:
+        for r in metadata[a].get("references", []):
+            clean = r.replace("global:", "", 1)
+            if clean in metadata and a in metadata[clean].get("references", []):
+                bidir.add(tuple(sorted((a, clean))))
+    top = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
+    best = top[0] if top else None
+
+    emit("## 全景统计")
+    emit()
+    emit("| 指标 | 数值 |")
+    emit("|------|------|")
+    emit(f"| 记忆总数 | {total} |")
+    emit(f"| 有引用的记忆数 | {len(with_refs)} |")
+    emit(f"| 引用边总数 | {edges} |")
+    emit(f"| 跨 scope 边数 | {cross} |")
+    emit(f"| 枢纽节点(入度≥3) | {len(hubs)} ({', '.join(hubs)}) |" if hubs else f"| 枢纽节点(入度≥3) | 0 |")
+    emit(f"| 平均出度 | {avg} |")
+    emit(f"| 孤立节点数 | {len(isolates)} |")
+    emit(f"| 双向引用对数 | {len(bidir)} |")
+    if best:
+        emit(f"| 最高分记忆 | {best} ({scores[best]:.1f}) |")
+    else:
+        emit("| 最高分记忆 | — |")
+    topics = _topic_groups(list(metadata.keys()))
+    topic_str = ", ".join(f"{k} ({len(v)})" for k, v in topics.items()) if topics else "—"
+    emit(f"| 覆盖技术主题 | {len(topics)} ({topic_str}) — 按 slug 前缀自动分组 |")
+
+    emit()
+    emit("### 热榜 Top 5(按引用分数排序)")
+    emit()
+    emit("| 排名 | 记忆 | 入度 | 出度 | 分数 |")
+    emit("|------|------|------|------|------|")
+    for i, n in enumerate(top[:5], 1):
+        out = len(metadata[n].get("references", []))
+        emit(f"| {i} | {n} | {in_degree.get(n, 0)} | {out} | {scores[n]:.1f} |")
+    coverage = f"{len(with_refs) / total * 100:.0f}%" if total else "0%"
+    emit()
+    emit(f"**覆盖率**:{coverage} 的记忆建立了引用关系,知识网络已形成初步骨架。分数 = 入度×2 + 出度×0.5,引用越多越核心。")
+
+
+def _topic_groups(slugs):
+    """Coarse grouping by slug prefix. Returns dict topic -> list of slugs."""
+    groups = {}
+    for s in slugs:
+        if s.startswith("onnx-"):
+            groups.setdefault("ONNX", []).append(s)
+        elif s.startswith(("cc-", "hook-")):
+            groups.setdefault("Claude Code", []).append(s)
+        elif s.startswith("archived-memory-"):
+            groups.setdefault("archived-memory", []).append(s)
+        elif s.startswith("git-"):
+            groups.setdefault("git", []).append(s)
+        elif s.startswith(("workflow-", "codex-")):
+            groups.setdefault("workflow", []).append(s)
+        else:
+            groups.setdefault("other", []).append(s)
+    return groups
 
 
 def _display_timeline(mem_dir, metadata, emit, no_mermaid=False):

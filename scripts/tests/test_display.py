@@ -144,3 +144,71 @@ class TestDisplayGraph(TestDisplayCLIBase):
         result = self._run("display", "--view", "graph")
         self.assertIn("may render densely in Feishu", result.stdout)
         self.assertIn("node-050", result.stdout)  # 不截断
+
+
+class TestDisplayStats(TestDisplayCLIBase):
+    def _setup_three_nodes(self):
+        for slug in ("alpha", "beta", "gamma"):
+            self._make_md(slug, f"# {slug.title()}\n\nContent.")
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": ["beta", "gamma"]},
+            {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": ["alpha"]},
+            {"name": "gamma", "description": "Gamma memory for testing.", "read_when": ["gamma topic"], "references": []},
+        ])
+
+    def test_stats_counts(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("| 记忆总数 | 3 |", result.stdout)
+        self.assertIn("| 引用边总数 | 3 |", result.stdout)   # alpha→beta/gamma,beta→alpha
+        self.assertIn("| 有引用的记忆数 | 2 |", result.stdout)  # alpha, beta
+
+    def test_stats_avg_out_degree(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats")
+        self.assertIn("| 平均出度 | 1.00 |", result.stdout)   # 3 边 / 3 节点
+
+    def test_stats_bidirectional_pairs(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats")
+        self.assertIn("| 双向引用对数 | 1 |", result.stdout)   # alpha↔beta
+
+    def test_stats_hub_count(self):
+        # gamma 入度 0,无枢纽;构造入度≥3
+        self._make_md("hub", "# Hub\n\nContent.")
+        self._setup_metadata([
+            {"name": "hub", "description": "Hub memory for testing.", "read_when": ["hub topic"], "references": []},
+            {"name": "a", "description": "A memory for testing.", "read_when": ["a topic"], "references": ["hub"]},
+            {"name": "b", "description": "B memory for testing.", "read_when": ["b topic"], "references": ["hub"]},
+            {"name": "c", "description": "C memory for testing.", "read_when": ["c topic"], "references": ["hub"]},
+        ])
+        result = self._run("display", "--view", "stats")
+        self.assertIn("| 枢纽节点(入度≥3) | 1 (hub) |", result.stdout)
+
+    def test_stats_top5_ordering(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats")
+        # score: alpha = 1*2+2*0.5=3.0,beta = 1*2+1*0.5=2.5,gamma = 0
+        idx_a = result.stdout.index("alpha")
+        idx_b = result.stdout.index("beta")
+        idx_g = result.stdout.index("gamma")
+        self.assertLess(idx_a, idx_b)
+        self.assertLess(idx_b, idx_g)
+
+    def test_stats_tech_topics(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats")
+        self.assertIn("覆盖技术主题", result.stdout)
+        self.assertIn("other", result.stdout)   # alpha/beta/gamma 无前缀 → other
+
+    def test_stats_empty(self):
+        result = self._run("display", "--view", "stats")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("记忆总数 | 0", result.stdout)
+
+    def test_stats_excludes_reflected(self):
+        self._setup_three_nodes()
+        result = self._run("display", "--view", "stats", "--exclude", "beta")
+        self.assertIn("| 记忆总数 | 2 |", result.stdout)
+        self.assertIn("| 引用边总数 | 1 |", result.stdout)  # alpha→gamma 保留,beta 边剔除

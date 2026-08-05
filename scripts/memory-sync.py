@@ -353,10 +353,8 @@ def _display_graph(mem_dir, metadata, emit, no_mermaid=False):
     for a in nodes:
         for b in metadata[a].get("references", []):
             # b 已剔除 exclude 与自引用(在 cmd_display 中完成)
-            if b.startswith("global:"):
-                emit(f'    {a} --> {b}')       # 跨 scope 边,标签含 global:
-            else:
-                emit(f'    {a} --> {b}')
+            # global: 前缀边跨 scope,标签原样输出含 global:B;本 scope 边无前缀。
+            emit(f'    {a} --> {b}')
     emit("```")
 
 
@@ -384,11 +382,16 @@ def _display_stats(mem_dir, metadata, emit):
     hubs = sorted((n for n, d in in_degree.items() if d >= 3), key=lambda n: n)
     avg = f"{edges / total:.2f}" if total else "0.00"
     isolates = [n for n, e in metadata.items() if in_degree.get(n, 0) == 0 and not e.get("references")]
+    # 预计算每个 slug 的引用集合(去除 global: 前缀),避免双向检查时 O(n²) 重建列表
+    refs_clean = {
+        n: {r.replace("global:", "", 1) for r in metadata[n].get("references", [])}
+        for n in metadata
+    }
     bidir = set()
     for a in metadata:
         for r in metadata[a].get("references", []):
             clean = r.replace("global:", "", 1)
-            if clean in metadata and a in [r.replace("global:", "", 1) for r in metadata[clean].get("references", [])]:
+            if clean in metadata and a in refs_clean.get(clean, set()):
                 bidir.add(tuple(sorted((a, clean))))
     top = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
     best = top[0] if top else None
@@ -506,7 +509,7 @@ def _resolve_hot_target_for_read(scope, cwd=None):
     return common.get_hot_list_target(scope, cwd=cwd)
 
 
-def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):
+def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None, scope=None):
     """Usage effect view: hot score bar chart + real hot list block + demo script."""
     scores, in_degree = common.compute_scores(metadata)
     top10 = sorted(metadata.keys(), key=lambda n: (-scores[n], n))[:10]
@@ -524,7 +527,7 @@ def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):
     else:
         _usage_bar_chart(top10, scores, emit)
 
-    _usage_hotlist_block(mem_dir, metadata, emit)
+    _usage_hotlist_block(mem_dir, metadata, emit, scope=scope)
     _usage_demo_script(emit)
 
 
@@ -544,19 +547,18 @@ def _usage_bar_chart(top10, scores, emit):
     emit("```")
 
 
-def _usage_hotlist_block(mem_dir, metadata, emit):
+def _usage_hotlist_block(mem_dir, metadata, emit, scope=None):
     """Read real hot list block from CLAUDE.md (or test-mock), filter excluded slugs."""
-    # scope detection: in test mode (_MEMORY_SYNC_TEST_DIR set), the mock hot list
-    # file is written as <test_dir>/CLAUDE.md (global target) per the test helper
-    # _make_hotlist_file, so treat scope as "global" to make the read resolve to
-    # that file. Out of test mode, infer scope from mem_dir: global memory dir →
-    # "global", otherwise "project".
-    test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
-    if test_dir:
-        scope = "global"
-    else:
-        global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
-        scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
+    # scope 来源:由 cmd_display 统一解析后传入(args.scope 显式 > 路径推断 > 测试模式 global)。
+    # 测试模式(_MEMORY_SYNC_TEST_DIR set)下 mock 热榜文件写在 <test_dir>/CLAUDE.md
+    # (global target),所以 scope 传 "global" 使读取重定向到该文件。
+    if scope is None:
+        test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+        if test_dir:
+            scope = "global"
+        else:
+            global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
+            scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
     hot_target = _resolve_hot_target_for_read(scope, cwd=mem_dir)
     emit("### 自动召回:双层机制")
     emit()
@@ -629,63 +631,76 @@ def cmd_display(mem_dir, args):
     def emit(text=""):
         print(text, file=out)
 
-    jsonl_path = get_jsonl_path(mem_dir)
-    metadata = common.read_metadata(jsonl_path)  # {} if missing
+    try:
+        jsonl_path = get_jsonl_path(mem_dir)
+        metadata = common.read_metadata(jsonl_path)  # {} if missing
 
-    # Stale metadata detection: metadata has entries whose .md files were deleted.
-    # Warn (read-only, no auto-cleanup) so the user knows to run sync.
-    if metadata:
-        md_files = {
-            f[:-3] for f in os.listdir(mem_dir)
-            if f.endswith(".md") and f not in ("INDEX.md", "MEMORY.md", "README.md")
-        }
-        stale = [n for n in metadata if n not in md_files]
-        if stale:
-            print(
-                f"WARNING: metadata has {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'} "
-                f"({', '.join(sorted(stale))}) with no .md file. Run $SM sync to clean up.",
-                file=sys.stderr,
-            )
+        # scope 解析(与 main() 的 --scope 覆盖一致):显式 > 路径推断 > 测试模式 global。
+        # 传给 _display_usage → _usage_hotlist_block,统一热榜读取的 scope 来源。
+        if getattr(args, "scope", "auto") in ("global", "project"):
+            scope = args.scope
+        else:
+            test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+            if test_dir:
+                scope = "global"
+            else:
+                global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
+                scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
 
-    # exclude 过滤:剔除 slug + 剔除指向被排除 slug 的边(避免悬空边)
-    for slug in list(exclude_set):
-        if slug not in metadata:
-            print(f"WARNING: exclude slug '{slug}' not found, ignored", file=sys.stderr)
-    for slug in exclude_set:
-        metadata.pop(slug, None)
-    for name, entry in metadata.items():
-        entry["references"] = [
-            r for r in entry.get("references", [])
-            if r.replace("global:", "", 1) not in exclude_set
-        ]
+        # Stale metadata detection: metadata has entries whose .md files were deleted.
+        # Warn (read-only, no auto-cleanup) so the user knows to run sync.
+        if metadata:
+            md_files = {
+                f[:-3] for f in os.listdir(mem_dir)
+                if f.endswith(".md") and f not in ("INDEX.md", "MEMORY.md", "README.md")
+            }
+            stale = [n for n in metadata if n not in md_files]
+            if stale:
+                print(
+                    f"WARNING: metadata has {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'} "
+                    f"({', '.join(sorted(stale))}) with no .md file. Run $SM sync to clean up.",
+                    file=sys.stderr,
+                )
 
-    # 防御:拒绝自引用(metadata 校验已禁止,但脏数据时跳过)
-    for name, entry in metadata.items():
-        entry["references"] = [r for r in entry.get("references", []) if r.replace("global:", "", 1) != name]
+        # exclude 过滤:剔除 slug + 剔除指向被排除 slug 的边(避免悬空边)
+        for slug in list(exclude_set):
+            if slug not in metadata:
+                print(f"WARNING: exclude slug '{slug}' not found, ignored", file=sys.stderr)
+        for slug in exclude_set:
+            metadata.pop(slug, None)
+        for name, entry in metadata.items():
+            entry["references"] = [
+                r for r in entry.get("references", [])
+                if r.replace("global:", "", 1) not in exclude_set
+            ]
 
-    if not metadata:
-        # 空库或全部被 exclude 排空 → 空状态占位
-        emit("## 知识图谱\n\n> 记忆库为空,暂无节点与引用。先运行 $SM sync 初始化。\n")
-        emit("## 全景统计\n\n| 指标 | 数值 |\n|------|------|\n| 记忆总数 | 0 |\n| 引用边总数 | 0 |\n")
-        emit("## 积累时间线\n\n> 记忆库为空,暂无时间线数据。\n")
-        emit("## 使用效果流\n\n> 记忆库为空。写入第一条记忆后重新运行 display 查看效果。")
-        if args.out:
-            out.close()
+        # 防御:拒绝自引用(metadata 校验已禁止,但脏数据时跳过)
+        for name, entry in metadata.items():
+            entry["references"] = [r for r in entry.get("references", []) if r.replace("global:", "", 1) != name]
+
+        if not metadata:
+            # 空库或全部被 exclude 排空 → 空状态占位
+            emit("## 知识图谱\n\n> 记忆库为空,暂无节点与引用。先运行 $SM sync 初始化。\n")
+            emit("## 全景统计\n\n| 指标 | 数值 |\n|------|------|\n| 记忆总数 | 0 |\n| 引用边总数 | 0 |\n")
+            emit("## 积累时间线\n\n> 记忆库为空,暂无时间线数据。\n")
+            emit("## 使用效果流\n\n> 记忆库为空。写入第一条记忆后重新运行 display 查看效果。")
+            return 0
+
+        for view in views:
+            if view == "graph":
+                _display_graph(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+            elif view == "stats":
+                _display_stats(mem_dir, metadata, emit)
+            elif view == "timeline":
+                _display_timeline(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+            elif view == "usage":
+                _display_usage(mem_dir, metadata, emit, no_mermaid=args.no_mermaid, args=args, scope=scope)
+
         return 0
-
-    for view in views:
-        if view == "graph":
-            _display_graph(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
-        elif view == "stats":
-            _display_stats(mem_dir, metadata, emit)
-        elif view == "timeline":
-            _display_timeline(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
-        elif view == "usage":
-            _display_usage(mem_dir, metadata, emit, no_mermaid=args.no_mermaid, args=args)
-
-    if args.out:
-        out.close()
-    return 0
+    finally:
+        # 确保文件句柄在任何路径(含异常)下都关闭;stdout 无需关闭。
+        if args.out and out is not sys.stdout:
+            out.close()
 
 
 def main():
@@ -740,7 +755,12 @@ def main():
         return 0
 
     mem_dir = get_mem_dir(scope_from_file=scope_file) if scope_file else get_mem_dir()
-    if args.command != "display":
+    if args.command == "display":
+        # --scope 显式覆盖 CWD 检测(spec §2.1);测试模式(_MEMORY_SYNC_TEST_DIR)优先于 --scope,
+        # 因 get_mem_dir 在测试模式下已返回 test_dir,这里不覆盖,保持现有测试行为。
+        if getattr(args, "scope", "auto") in ("global", "project") and not os.environ.get("_MEMORY_SYNC_TEST_DIR"):
+            mem_dir = common.get_memory_dir(args.scope)
+    else:
         os.makedirs(mem_dir, exist_ok=True)
 
     dry_run = getattr(args, 'dry_run', False)

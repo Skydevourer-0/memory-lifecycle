@@ -446,6 +446,39 @@ class TestDisplayIntegration(TestDisplayCLIBase):
         # _MEMORY_SYNC_TEST_DIR 优先,mem_dir 为测试目录,returncode 0
         self.assertEqual(result.returncode, 0)
 
+    def test_scope_explicit_overrides_auto(self):
+        # Finding 1 修复验证:`--scope global` 显式传参必须覆盖 CWD 自动检测。
+        # 现有 _run 设 _MEMORY_SYNC_TEST_DIR 使 get_mem_dir 返回 test_dir,
+        # 而 --scope 修复后测试模式优先于 scope——所以此测试需在非测试模式下验证。
+        # 方案:在临时项目目录(有 .git,auto 检测会判 project)下运行,
+        # 不设 _MEMORY_SYNC_TEST_DIR,用 `--scope global` 覆盖 → 读真实全局库。
+        # 断言 stdout 含真实全局库的已知 slug,证明 mem_dir 指向 global 而非 project。
+        project_tmp = tempfile.TemporaryDirectory()
+        try:
+            project_dir = project_tmp.name
+            # 模拟项目目录:有 .git → auto 检测为 project
+            os.makedirs(os.path.join(project_dir, ".git"))
+            env = os.environ.copy()
+            # 关键:不设 _MEMORY_SYNC_TEST_DIR,让 --scope 真正生效
+            env.pop("_MEMORY_SYNC_TEST_DIR", None)
+            # CWD 设为项目目录(影响 detect_scope / get_memory_dir 的 cwd 推断)
+            proc = subprocess.run(
+                [sys.executable, MEMORY_SYNC, "display", "--scope", "global", "--view", "stats"],
+                capture_output=True, text=True, env=env, cwd=project_dir,
+            )
+            self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
+            # 真实全局库含已知 slug(preferences/security/onnx-shape-inference 等),
+            # 若 --scope global 未生效则会读 project 目录(空)或 test_dir(未设)→ 无这些 slug。
+            # 用宽松断言:只要输出含 "全景统计" 表头且记忆总数 > 0,即证明读了非空全局库。
+            self.assertIn("## 全景统计", proc.stdout)
+            # 全局库当前有 19 条记忆(随使用变化,断言 > 0 即可)
+            import re
+            m = re.search(r"\| 记忆总数 \| (\d+) \|", proc.stdout)
+            self.assertIsNotNone(m, f"记忆总数行未找到: {proc.stdout}")
+            self.assertGreater(int(m.group(1)), 0, f"--scope global 未读到全局库: {proc.stdout}")
+        finally:
+            project_tmp.cleanup()
+
     def test_empty_memory_dir(self):
         # 只有空 memory 目录,无 .md 无 jsonl
         result = self._run("display", "--view", "all")

@@ -223,3 +223,89 @@ class TestDisplayStats(TestDisplayCLIBase):
         result = self._run("display", "--view", "stats", "--exclude", "beta")
         self.assertIn("| 记忆总数 | 2 |", result.stdout)
         self.assertIn("| 引用边总数 | 1 |", result.stdout)  # alpha→gamma 保留,beta 边剔除
+
+
+class TestDisplayTimeline(TestDisplayCLIBase):
+    def _set_mtime(self, slug, y, m, d):
+        import datetime
+        path = os.path.join(self.mem_dir, f"{slug}.md")
+        os.utime(path, (datetime.datetime(y, m, d, 12, 0, tzinfo=datetime.timezone.utc).timestamp(),) * 2)
+
+    def _setup_two_months(self):
+        self._make_md("alpha", "# Alpha\n\nContent.")
+        self._make_md("beta", "# Beta\n\nContent.")
+        self._set_mtime("alpha", 2026, 6, 30)
+        self._set_mtime("beta", 2026, 7, 1)
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": []},
+            {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": []},
+        ])
+
+    def test_timeline_monthly_buckets(self):
+        self._setup_two_months()
+        result = self._run("display", "--view", "timeline")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("section 2026-06", result.stdout)
+        self.assertIn("section 2026-07", result.stdout)
+        self.assertIn("timeline", result.stdout)
+
+    def test_timeline_same_day_merge(self):
+        self._make_md("alpha", "# Alpha\n\nContent.")
+        self._make_md("beta", "# Beta\n\nContent.")
+        self._set_mtime("alpha", 2026, 7, 1)
+        self._set_mtime("beta", 2026, 7, 1)
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": []},
+            {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": []},
+        ])
+        result = self._run("display", "--view", "timeline")
+        # 同日合并到同一行,用 `:` 换行续接
+        self.assertIn("7月1日 : alpha", result.stdout)
+        self.assertIn(": beta", result.stdout)
+
+    def test_timeline_skips_index_files(self):
+        self._make_md("alpha", "# Alpha\n\nContent.")
+        self._make_md("INDEX.md", "# Index")
+        self._make_md("MEMORY.md", "# Memory")
+        self._make_md("README.md", "# Readme")
+        self._make_md("old.migrate-bak", "# Old")
+        self._set_mtime("alpha", 2026, 7, 1)
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": []},
+        ])
+        result = self._run("display", "--view", "timeline")
+        self.assertNotIn("INDEX", result.stdout)
+        self.assertNotIn("MEMORY", result.stdout)
+        self.assertNotIn("README", result.stdout)
+        self.assertNotIn("migrate-bak", result.stdout)
+
+    def test_timeline_date_format(self):
+        self._setup_two_months()
+        result = self._run("display", "--view", "timeline")
+        self.assertIn("6月30日", result.stdout)
+        self.assertIn("7月1日", result.stdout)
+
+    def test_timeline_excludes_slug(self):
+        self._setup_two_months()
+        result = self._run("display", "--view", "timeline", "--exclude", "beta")
+        self.assertNotIn("beta", result.stdout)
+
+    def test_timeline_single_month(self):
+        self._make_md("alpha", "# Alpha\n\nContent.")
+        self._set_mtime("alpha", 2026, 7, 1)
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": []},
+        ])
+        result = self._run("display", "--view", "timeline")
+        self.assertIn("section 2026-07", result.stdout)
+
+    def test_timeline_no_mermaid_flag(self):
+        self._setup_two_months()
+        result = self._run("display", "--view", "timeline", "--no-mermaid")
+        self.assertNotIn("```mermaid", result.stdout)
+        self.assertIn("| 月份 | 当月活跃记忆数 | 记忆列表 |", result.stdout)
+
+    def test_timeline_empty(self):
+        result = self._run("display", "--view", "timeline")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("暂无时间线数据", result.stdout)

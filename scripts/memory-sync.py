@@ -446,9 +446,51 @@ def _topic_groups(slugs):
 
 
 def _display_timeline(mem_dir, metadata, emit, no_mermaid=False):
-    """Placeholder — Task 4 fills this in."""
-    emit("# 视图待实现: timeline")
-    return 0
+    """Accumulation timeline view: mermaid timeline by YYYY-MM buckets (mtime)."""
+    from datetime import datetime, timezone
+    buckets = {}  # YYYY-MM -> {day: [slug, ...]}
+    for slug in metadata:
+        path = os.path.join(mem_dir, f"{slug}.md")
+        if not os.path.exists(path):
+            continue
+        ts = os.path.getmtime(path)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        key = dt.strftime("%Y-%m")
+        day = f"{dt.month}月{dt.day}日"
+        buckets.setdefault(key, {}).setdefault(day, []).append(slug)
+    if not buckets:
+        emit("## 积累时间线")
+        emit()
+        emit("> 记忆库为空,暂无时间线数据。")
+        return
+
+    if no_mermaid:
+        _timeline_as_table(buckets, emit)
+        return
+
+    emit("## 积累时间线")
+    emit("```mermaid")
+    emit("timeline")
+    emit("    title 记忆积累时间线")
+    for month in sorted(buckets):
+        emit(f"    section {month}")
+        for day in sorted(buckets[month], key=lambda d: (int(d.split("月")[0]), int(d.split("月")[1].rstrip("日")))):
+            slugs = sorted(buckets[month][day])
+            for i, s in enumerate(slugs):
+                prefix = f"        {day} :" if i == 0 else "              :"
+                emit(f"{prefix} {s}")
+    emit("```")
+
+
+def _timeline_as_table(buckets, emit):
+    """--no-mermaid fallback: month -> count -> slug list."""
+    emit("## 积累时间线")
+    emit()
+    emit("| 月份 | 当月活跃记忆数 | 记忆列表 |")
+    emit("|------|--------------|---------|")
+    for month in sorted(buckets):
+        day_slugs = sorted(s for day in buckets[month] for s in buckets[month][day])
+        emit(f"| {month} | {len(day_slugs)} | {', '.join(day_slugs)} |")
 
 
 def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):

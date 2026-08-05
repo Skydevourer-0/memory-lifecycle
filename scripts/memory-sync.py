@@ -493,10 +493,119 @@ def _timeline_as_table(buckets, emit):
         emit(f"| {month} | {len(day_slugs)} | {', '.join(day_slugs)} |")
 
 
+def _resolve_hot_target_for_read(scope, cwd=None):
+    """Resolve hot list file path for reading.
+    In test mode (_MEMORY_SYNC_TEST_DIR set), redirect to test dir's mock file,
+    symmetric with cmd_sync's test-mode skip: sync skips write, display redirects read."""
+    test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+    if test_dir:
+        # global scope → <test_dir>/CLAUDE.md;project scope → <test_dir>/MEMORY.md
+        if scope == "global":
+            return os.path.join(test_dir, "CLAUDE.md")
+        return os.path.join(test_dir, "MEMORY.md")
+    return common.get_hot_list_target(scope, cwd=cwd)
+
+
 def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None):
-    """Placeholder — Task 5 fills this in."""
-    emit("# 视图待实现: usage")
-    return 0
+    """Usage effect view: hot score bar chart + real hot list block + demo script."""
+    scores, in_degree = common.compute_scores(metadata)
+    top10 = sorted(metadata.keys(), key=lambda n: (-scores[n], n))[:10]
+
+    if no_mermaid:
+        emit("## 使用效果流")
+        emit()
+        emit("### 热榜分数分布(Top 10)")
+        emit()
+        emit("| 排名 | 记忆 | 分数 | 入度 | 出度 |")
+        emit("|------|------|------|------|------|")
+        for i, n in enumerate(top10, 1):
+            out = len(metadata[n].get("references", []))
+            emit(f"| {i} | {n} | {scores[n]:.1f} | {in_degree.get(n, 0)} | {out} |")
+    else:
+        _usage_bar_chart(top10, scores, emit)
+
+    _usage_hotlist_block(mem_dir, metadata, emit)
+    _usage_demo_script(emit)
+
+
+def _usage_bar_chart(top10, scores, emit):
+    """xychart-beta bar chart of top-10 scores."""
+    emit("## 使用效果流")
+    emit()
+    emit("### 热榜分数分布(Top 10)")
+    emit("```mermaid")
+    emit('xychart-beta')
+    emit('    title "热榜分数分布(Top 10)"')
+    slugs = ", ".join(f'"{s}"' for s in top10)
+    emit(f'    x-axis [{slugs}]')
+    emit('    y-axis "分数" 0 --> 8')
+    bars = ", ".join(f"{scores[n]:.1f}" for n in top10)
+    emit(f"    bar [{bars}]")
+    emit("```")
+
+
+def _usage_hotlist_block(mem_dir, metadata, emit):
+    """Read real hot list block from CLAUDE.md (or test-mock), filter excluded slugs."""
+    # scope detection: in test mode (_MEMORY_SYNC_TEST_DIR set), the mock hot list
+    # file is written as <test_dir>/CLAUDE.md (global target) per the test helper
+    # _make_hotlist_file, so treat scope as "global" to make the read resolve to
+    # that file. Out of test mode, infer scope from mem_dir: global memory dir →
+    # "global", otherwise "project".
+    test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+    if test_dir:
+        scope = "global"
+    else:
+        global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
+        scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
+    hot_target = _resolve_hot_target_for_read(scope, cwd=mem_dir)
+    emit("### 自动召回:双层机制")
+    emit()
+    emit("**热层(零操作自动加载)**")
+    emit()
+    emit("Claude Code 启动时自动加载 CLAUDE.md,其中 memory-index 块由 sync 自动注入。")
+    emit("当前热榜(Top 10,按引用分数排序,自动写入):")
+    emit()
+    if os.path.exists(hot_target):
+        with open(hot_target, "r") as f:
+            content = f.read()
+        start = content.find(common.HOT_LIST_MARKER_START)
+        end = content.find(common.HOT_LIST_MARKER_END)
+        if start != -1 and end != -1 and end > start:
+            block = content[start + len(common.HOT_LIST_MARKER_START):end]
+            matched = False
+            for line in block.splitlines():
+                # 只输出含 metadata 中 slug 的行(exclude 已从 metadata 剔除)
+                if any(f"[{s}]" in line or f"({s})" in line for s in metadata):
+                    emit(line)
+                    matched = True
+            if not matched:
+                emit("> 热榜块中没有匹配的记忆条目。")
+        else:
+            emit("> 未找到 memory-index 热榜块,运行 $SM sync 后重试")
+    else:
+        emit("> 未找到 memory-index 热榜块,运行 $SM sync 后重试")
+    emit()
+    emit("**温层(按需 grep)**")
+    emit()
+    emit("当任务涉及特定主题时,Claude 主动 grep INDEX.md 的 read-when 字段匹配关键词,")
+    emit("再按需读取对应记忆文件。例如任务提及\"ONNX 量化\",命中 onnx-qdq-quant-param-detection 的 read-when 短语。")
+
+
+def _usage_demo_script(emit):
+    """Fixed demo script text (not dynamic data)."""
+    emit("### 演示脚本(可照着跑)")
+    emit()
+    emit("以下命令可在任何已安装 memory-lifecycle 的机器上复现:")
+    emit()
+    emit('1. 定义命令缩写:`SM="python3 $HOME/.claude/skills/memory-lifecycle/scripts/memory-sync.py"`')
+    emit("2. 查看全景统计:`$SM display --view stats`")
+    emit("3. 生成知识图谱(贴 Feishu 自动渲染):`$SM display --view graph`")
+    emit("4. 查看积累时间线:`$SM display --view timeline`")
+    emit("5. 查看完整演示(四视图合一):`$SM display --view all`")
+    emit("6. 脱敏:排除含内部细节的记忆:`$SM display --exclude codex-workflow,cc-memory-injection`")
+    emit("7. 验证引用图健康度(对外展示前自查):`$SM audit`")
+    emit()
+    emit("> 截图说明:以上命令的终端输出截图由文档维护者人工补充。mermaid 代码块直接粘贴到 Feishu 即可自动渲染为图形。")
 
 
 def cmd_display(mem_dir, args):

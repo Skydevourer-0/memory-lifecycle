@@ -309,3 +309,73 @@ class TestDisplayTimeline(TestDisplayCLIBase):
         result = self._run("display", "--view", "timeline")
         self.assertEqual(result.returncode, 0)
         self.assertIn("暂无时间线数据", result.stdout)
+
+
+class TestDisplayUsage(TestDisplayCLIBase):
+    def _setup_nodes(self):
+        self._make_md("alpha", "# Alpha\n\nContent.")
+        self._make_md("beta", "# Beta\n\nContent.")
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": ["beta"]},
+            {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": []},
+        ])
+
+    def _make_hotlist_file(self, content):
+        # 在 _MEMORY_SYNC_TEST_DIR 下写 mock 热榜文件(测试模式重定向目标)
+        path = os.path.join(self.mem_dir, "CLAUDE.md")
+        with open(path, "w") as f:
+            f.write(content)
+
+    def test_usage_bar_chart(self):
+        self._setup_nodes()
+        result = self._run("display", "--view", "usage")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("xychart-beta", result.stdout)
+        self.assertIn("bar [", result.stdout)
+        # alpha references beta → beta in_degree=1 (score 2.0) > alpha (score 0.5),
+        # so beta sorts first in top10. Assert the actual correct order.
+        self.assertIn('x-axis ["beta", "alpha"]', result.stdout)
+
+    def test_usage_reads_real_hotlist(self):
+        # mock 热榜文件:含 2 条 slug 热榜行 → usage 输出应含这 2 行
+        self._setup_nodes()
+        self._make_hotlist_file(
+            "<!-- memory-index:start -->\n"
+            "- [alpha](alpha.md) — Alpha description here.\n"
+            "- [beta](beta.md) — Beta description here.\n"
+            "<!-- memory-index:end -->\n"
+        )
+        result = self._run("display", "--view", "usage")
+        self.assertIn("Alpha description here.", result.stdout)
+        self.assertIn("Beta description here.", result.stdout)
+
+    def test_usage_hotlist_excludes_slug(self):
+        self._setup_nodes()
+        self._make_hotlist_file(
+            "<!-- memory-index:start -->\n"
+            "- [alpha](alpha.md) — Alpha description here.\n"
+            "- [beta](beta.md) — Beta description here.\n"
+            "<!-- memory-index:end -->\n"
+        )
+        result = self._run("display", "--view", "usage", "--exclude", "alpha")
+        self.assertIn("Beta description here.", result.stdout)
+        self.assertNotIn("Alpha description here.", result.stdout)
+
+    def test_usage_hotlist_no_markers(self):
+        self._setup_nodes()
+        self._make_hotlist_file("no markers here\n")
+        result = self._run("display", "--view", "usage")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("未找到 memory-index 热榜块", result.stdout)
+
+    def test_usage_demo_script_present(self):
+        self._setup_nodes()
+        result = self._run("display", "--view", "usage")
+        self.assertIn("演示脚本(可照着跑)", result.stdout)
+        self.assertIn("$SM display --view stats", result.stdout)
+
+    def test_usage_no_mermaid_flag(self):
+        self._setup_nodes()
+        result = self._run("display", "--view", "usage", "--no-mermaid")
+        self.assertNotIn("```mermaid", result.stdout)
+        self.assertIn("| 排名 | 记忆 | 分数 |", result.stdout)

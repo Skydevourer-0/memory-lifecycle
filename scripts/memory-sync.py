@@ -360,8 +360,12 @@ def cmd_display(mem_dir, args):
     out = sys.stdout
     if args.out:
         parent = os.path.dirname(os.path.abspath(args.out))
-        os.makedirs(parent, exist_ok=True)
-        out = open(args.out, "w", encoding="utf-8")
+        try:
+            os.makedirs(parent, exist_ok=True)
+            out = open(args.out, "w", encoding="utf-8")
+        except OSError as e:
+            print(f"display: cannot write to --out '{args.out}': {e}", file=sys.stderr)
+            return 2
 
     def emit(text=""):
         print(text, file=out)

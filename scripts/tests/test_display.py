@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import subprocess
@@ -37,6 +38,12 @@ class TestDisplayCLIBase(unittest.TestCase):
             for entry in entries:
                 json.dump(entry, f)
                 f.write("\n")
+
+    def _make_hotlist_file(self, content):
+        # 在 _MEMORY_SYNC_TEST_DIR 下写 mock 热榜文件(测试模式重定向目标)
+        path = os.path.join(self.mem_dir, "CLAUDE.md")
+        with open(path, "w") as f:
+            f.write(content)
 
 
 class TestDisplayCLI(TestDisplayCLIBase):
@@ -320,12 +327,6 @@ class TestDisplayUsage(TestDisplayCLIBase):
             {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": []},
         ])
 
-    def _make_hotlist_file(self, content):
-        # 在 _MEMORY_SYNC_TEST_DIR 下写 mock 热榜文件(测试模式重定向目标)
-        path = os.path.join(self.mem_dir, "CLAUDE.md")
-        with open(path, "w") as f:
-            f.write(content)
-
     def test_usage_bar_chart(self):
         self._setup_nodes()
         result = self._run("display", "--view", "usage")
@@ -379,3 +380,120 @@ class TestDisplayUsage(TestDisplayCLIBase):
         result = self._run("display", "--view", "usage", "--no-mermaid")
         self.assertNotIn("```mermaid", result.stdout)
         self.assertIn("| 排名 | 记忆 | 分数 |", result.stdout)
+
+    def test_usage_empty(self):
+        # spec §5.2: empty memory dir runs usage view, returncode 0, empty placeholder.
+        result = self._run("display", "--view", "usage")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("记忆库为空", result.stdout)
+
+
+class TestDisplayIntegration(TestDisplayCLIBase):
+    def _setup_full(self):
+        for slug in ("alpha", "beta", "gamma"):
+            self._make_md(slug, f"# {slug.title()}\n\nContent.")
+        self._setup_metadata([
+            {"name": "alpha", "description": "Alpha memory for testing.", "read_when": ["alpha topic"], "references": ["beta"]},
+            {"name": "beta", "description": "Beta memory for testing.", "read_when": ["beta topic"], "references": ["gamma"]},
+            {"name": "gamma", "description": "Gamma memory for testing.", "read_when": ["gamma topic"], "references": []},
+        ])
+        # mtime 分布:alpha 6月30,beta 7月1,gamma 7月3
+        for slug, (y, m, d) in {"alpha": (2026, 6, 30), "beta": (2026, 7, 1), "gamma": (2026, 7, 3)}.items():
+            os.utime(os.path.join(self.mem_dir, f"{slug}.md"),
+                     (datetime.datetime(y, m, d, 12, 0, tzinfo=datetime.timezone.utc).timestamp(),) * 2)
+
+    def test_view_all_order(self):
+        self._setup_full()
+        result = self._run("display", "--view", "all")
+        self.assertEqual(result.returncode, 0)
+        idx_g = result.stdout.index("## 知识图谱")
+        idx_s = result.stdout.index("## 全景统计")
+        idx_t = result.stdout.index("## 积累时间线")
+        idx_u = result.stdout.index("## 使用效果流")
+        self.assertTrue(idx_g < idx_s < idx_t < idx_u)
+
+    def test_out_file_writes(self):
+        self._setup_full()
+        out_path = os.path.join(self.tmp.name, "out", "display.md")
+        result = self._run("display", "--view", "graph", "--out", out_path)
+        self.assertEqual(result.returncode, 0)
+        with open(out_path) as f:
+            content = f.read()
+        self.assertIn("graph LR", content)
+
+    def test_out_file_unwritable(self):
+        self._setup_full()
+        # 只读目录模拟:父目录不可写 → open 失败 → exit 2 + ERROR on stderr
+        ro_dir = os.path.join(self.tmp.name, "ro")
+        os.makedirs(ro_dir)
+        os.chmod(ro_dir, 0o444)
+        try:
+            result = self._run("display", "--view", "graph", "--out", os.path.join(ro_dir, "x.md"))
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ERROR", result.stderr)
+        finally:
+            os.chmod(ro_dir, 0o755)
+
+    def test_scope_global_explicit(self):
+        self._setup_full()
+        result = self._run("display", "--view", "graph", "--scope", "global")
+        self.assertEqual(result.returncode, 0)
+
+    def test_scope_project_no_git_fallback(self):
+        self._setup_full()
+        result = self._run("display", "--view", "graph", "--scope", "project")
+        # 测试目录无 .git → get_memory_dir fallback 到 global;不报错
+        # _MEMORY_SYNC_TEST_DIR 优先,mem_dir 为测试目录,returncode 0
+        self.assertEqual(result.returncode, 0)
+
+    def test_empty_memory_dir(self):
+        # 只有空 memory 目录,无 .md 无 jsonl
+        result = self._run("display", "--view", "all")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("记忆库为空", result.stdout)
+
+    def test_all_excluded_empty(self):
+        self._setup_full()
+        result = self._run("display", "--view", "graph", "--exclude", "alpha,beta,gamma")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("记忆库为空", result.stdout)
+
+    def test_stale_metadata_warning(self):
+        # metadata 有条目但 .md 已删
+        self._setup_metadata([
+            {"name": "ghost", "description": "Ghost memory for testing.", "read_when": ["ghost topic"], "references": []},
+        ])
+        result = self._run("display", "--view", "graph")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("WARNING", result.stderr)
+
+    def test_readonly_no_side_effects(self):
+        self._setup_full()
+        jsonl_before = os.path.getmtime(self.jsonl_path)
+        idx_path = os.path.join(self.mem_dir, "INDEX.md")
+        if os.path.exists(idx_path):
+            idx_before = os.path.getmtime(idx_path)
+        else:
+            idx_before = None
+        self._run("display", "--view", "all")
+        self.assertEqual(os.path.getmtime(self.jsonl_path), jsonl_before)
+        if idx_before is not None:
+            self.assertEqual(os.path.getmtime(idx_path), idx_before)
+
+    def test_no_hook_trigger(self):
+        self._setup_full()
+        result = self._run("display", "--view", "graph")
+        # 不输出 additionalContext JSON(与 hint 区分)
+        self.assertNotIn("hookSpecificOutput", result.stdout)
+
+    def test_test_mode_redirects_hotlist(self):
+        # 验证 _resolve_hot_target_for_read 重定向逻辑本身
+        self._setup_full()
+        self._make_hotlist_file(
+            "<!-- memory-index:start -->\n"
+            "- [alpha](alpha.md) — Alpha description here.\n"
+            "<!-- memory-index:end -->\n"
+        )
+        result = self._run("display", "--view", "usage")
+        self.assertIn("Alpha description here.", result.stdout)
+        self.assertNotIn("真实~/.claude/CLAUDE.md", result.stdout)  # 未访问真实文件

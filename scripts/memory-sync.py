@@ -623,7 +623,7 @@ def cmd_display(mem_dir, args):
             os.makedirs(parent, exist_ok=True)
             out = open(args.out, "w", encoding="utf-8")
         except OSError as e:
-            print(f"display: cannot write to --out '{args.out}': {e}", file=sys.stderr)
+            print(f"ERROR: cannot write to --out '{args.out}': {e}", file=sys.stderr)
             return 2
 
     def emit(text=""):
@@ -631,6 +631,21 @@ def cmd_display(mem_dir, args):
 
     jsonl_path = get_jsonl_path(mem_dir)
     metadata = common.read_metadata(jsonl_path)  # {} if missing
+
+    # Stale metadata detection: metadata has entries whose .md files were deleted.
+    # Warn (read-only, no auto-cleanup) so the user knows to run sync.
+    if metadata:
+        md_files = {
+            f[:-3] for f in os.listdir(mem_dir)
+            if f.endswith(".md") and f not in ("INDEX.md", "MEMORY.md", "README.md")
+        }
+        stale = [n for n in metadata if n not in md_files]
+        if stale:
+            print(
+                f"WARNING: metadata has {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'} "
+                f"({', '.join(sorted(stale))}) with no .md file. Run $SM sync to clean up.",
+                file=sys.stderr,
+            )
 
     # exclude 过滤:剔除 slug + 剔除指向被排除 slug 的边(避免悬空边)
     for slug in list(exclude_set):

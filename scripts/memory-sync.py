@@ -329,9 +329,49 @@ def cmd_audit(mem_dir):
 
 
 def _display_graph(mem_dir, metadata, emit, no_mermaid=False):
-    """Placeholder — Task 2 fills this in."""
-    emit("# 视图待实现: graph")
-    return 0
+    """Knowledge graph view: mermaid graph LR of slugs + references."""
+    scores, in_degree = common.compute_scores(metadata)
+    if no_mermaid:
+        _graph_as_table(metadata, in_degree, emit)
+        return
+
+    nodes = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
+    emit("## 知识图谱")
+    if len(nodes) > 50:
+        emit(f"<!-- {len(nodes)} nodes, may render densely in Feishu -->")
+    emit("```mermaid")
+    emit("graph LR")
+    for n in nodes:
+        out_deg = len(metadata[n].get("references", []))
+        if in_degree.get(n, 0) >= 3:
+            emit(f'    {n}(["{n}"])')          # 枢纽:圆角矩形 + 加粗
+        elif in_degree.get(n, 0) > 0 or out_deg > 0:
+            emit(f'    {n}["{n}"]')            # 有连接:方框
+        else:
+            emit(f'    {n}("{n}")')            # 孤立:圆角
+    emit()
+    for a in nodes:
+        for b in metadata[a].get("references", []):
+            # b 已剔除 exclude 与自引用(在 cmd_display 中完成)
+            if b.startswith("global:"):
+                emit(f'    {a} --> {b}')       # 跨 scope 边,标签含 global:
+            else:
+                emit(f'    {a} --> {b}')
+    emit("```")
+
+
+def _graph_as_table(metadata, in_degree, emit):
+    """--no-mermaid fallback: adjacency list table."""
+    emit("## 知识图谱(邻接表形式)")
+    emit()
+    emit("| 节点 | 引用(出边) | 被引用(入边) |")
+    emit("|------|------------|--------------|")
+    for a in sorted(metadata.keys()):
+        out = metadata[a].get("references", [])
+        in_cnt = in_degree.get(a, 0)
+        out_str = ", ".join(out) if out else "—"
+        in_str = f"{in_cnt}" if in_cnt else "— (孤立)" if not out else "—"
+        emit(f"| {a} | {out_str} | {in_str} |")
 
 
 def _display_stats(mem_dir, metadata, emit):

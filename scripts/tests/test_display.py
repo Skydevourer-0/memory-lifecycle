@@ -189,12 +189,23 @@ class TestDisplayStats(TestDisplayCLIBase):
     def test_stats_top5_ordering(self):
         self._setup_three_nodes()
         result = self._run("display", "--view", "stats")
-        # score: alpha = 1*2+2*0.5=3.0,beta = 1*2+1*0.5=2.5,gamma = 0
+        # score: alpha = 1*2+2*0.5=3.0,beta = 1*2+1*0.5=2.5,gamma = 1*2+0*0.5=2.0
         idx_a = result.stdout.index("alpha")
         idx_b = result.stdout.index("beta")
         idx_g = result.stdout.index("gamma")
         self.assertLess(idx_a, idx_b)
         self.assertLess(idx_b, idx_g)
+
+    def test_stats_bidirectional_global_prefix(self):
+        # a 引用 global:b,b 引用 global:a → 双向对数 1(对称清洗)
+        self._make_md("a", "# A\n\nContent.")
+        self._make_md("b", "# B\n\nContent.")
+        self._setup_metadata([
+            {"name": "a", "description": "A memory for testing.", "read_when": ["a topic"], "references": ["global:b"]},
+            {"name": "b", "description": "B memory for testing.", "read_when": ["b topic"], "references": ["global:a"]},
+        ])
+        result = self._run("display", "--view", "stats")
+        self.assertIn("| 双向引用对数 | 1 |", result.stdout)
 
     def test_stats_tech_topics(self):
         self._setup_three_nodes()

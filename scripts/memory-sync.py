@@ -388,7 +388,7 @@ def _display_stats(mem_dir, metadata, emit):
     for a in metadata:
         for r in metadata[a].get("references", []):
             clean = r.replace("global:", "", 1)
-            if clean in metadata and a in metadata[clean].get("references", []):
+            if clean in metadata and a in [r.replace("global:", "", 1) for r in metadata[clean].get("references", [])]:
                 bidir.add(tuple(sorted((a, clean))))
     top = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
     best = top[0] if top else None

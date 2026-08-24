@@ -11,16 +11,47 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 
 
+def _is_under_memory_dir(filepath):
+    """Return True if filepath lives under a known memory directory.
+    Guards against pathPattern mismatches in the hook system — when the hook
+    fires for non-memory files, the script should silently exit 0."""
+    expanded = os.path.abspath(os.path.expanduser(filepath))
+    global_mem = os.path.abspath(os.path.expanduser("~/.claude/global/memory"))
+    projects_dir = os.path.abspath(os.path.expanduser("~/.claude/projects"))
+    if expanded.startswith(global_mem + os.sep):
+        return True
+    if expanded.startswith(projects_dir + os.sep):
+        # Expected: <project-slug>/memory/<file>.md
+        rel = expanded[len(projects_dir + os.sep):]
+        parts = rel.split(os.sep)
+        if len(parts) >= 2 and parts[1] == "memory":
+            return True
+    return False
+
+
 def get_mem_dir(scope_from_file=None):
-    """Resolve memory directory. Test override -> scope-from-file -> CWD detection."""
+    """Resolve memory directory. Test override -> scope-from-file -> CWD detection.
+    When scope_from_file is given, derive mem_dir directly from the file path
+    (the file already lives under the correct memory dir, no need for git discovery)."""
     test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
     if test_dir:
         return test_dir
     if scope_from_file:
-        scope = common.detect_scope_from_file(scope_from_file)
-    else:
-        scope = common.detect_scope()
-    return common.get_memory_dir(scope, cwd=os.path.dirname(scope_from_file) if scope_from_file else None)
+        expanded = os.path.expanduser(scope_from_file)
+        project_prefix = os.path.expanduser("~/.claude/projects/")
+        global_mem = os.path.expanduser("~/.claude/global/memory")
+        if expanded.startswith(global_mem):
+            return global_mem
+        if expanded.startswith(project_prefix):
+            # Extract ~/.claude/projects/<slug>/memory from the file path
+            rel = expanded[len(project_prefix):]
+            parts = rel.split(os.sep, 1)
+            if parts:
+                slug = parts[0]
+                return os.path.join(project_prefix, slug, "memory")
+        # Fallback: scope detection from CWD
+        return common.get_memory_dir("project", cwd=os.path.dirname(expanded))
+    return common.get_memory_dir(common.detect_scope())
 
 
 def get_jsonl_path(mem_dir):
@@ -102,11 +133,18 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
 
     print(f"INDEX.md written ({len(metadata)} memories)")
     if new_stubs:
-        print(f"{new_stubs} new memories awaiting metadata. Run sync-memory --hint <slug> for each.")
+        print(f"{new_stubs} new memories awaiting metadata. Run $SM hint <slug> for each.")
     return 0
 
 
-def cmd_hint(mem_dir, slug):
+def cmd_hint(mem_dir, slug, hook_mode=False):
+    """Show metadata hints for a memory file. In hook_mode, diagnostic text
+    goes to stderr so stdout is reserved for additionalContext JSON (the
+    caller always emits additionalContext in hook mode — no needs_review
+    return needed). In manual mode, everything goes to stdout."""
+    out = sys.stderr if hook_mode else sys.stdout
+    if slug in ("INDEX", "MEMORY", "README"):
+        return 0  # silent skip for hot-list and infrastructure files
     md_path = os.path.join(mem_dir, f"{slug}.md")
     if not os.path.exists(md_path):
         print(f"{slug}: file not found", file=sys.stderr)
@@ -116,7 +154,8 @@ def cmd_hint(mem_dir, slug):
     metadata = common.read_metadata(jsonl_path)
 
     if slug not in metadata:
-        print(f"{slug}: not yet registered in metadata. Run sync-memory first, then --hint again.")
+        print(f"{slug}: not yet registered in metadata. Run sync-memory sync first, then hint again.",
+              file=out)
         return 1
 
     with open(md_path, "r") as f:
@@ -131,34 +170,34 @@ def cmd_hint(mem_dir, slug):
     if os.path.exists(global_mem_dir) and mem_dir != global_mem_dir:
         global_metadata = common.read_metadata(os.path.join(global_mem_dir, "metadata.jsonl"))
 
-    print(f"Metadata hints for '{slug}':")
+    print(f"Metadata hints for '{slug}':", file=out)
     if headings:
-        print("  Body headings (candidates for read_when):")
+        print("  Body headings (candidates for read_when):", file=out)
         for h in headings:
-            print(f"    ## {h}")
-    print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10")
+            print(f"    ## {h}", file=out)
+    print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10", file=out)
     if current_slugs:
-        print(f"  Available slugs (current scope):  [{', '.join(current_slugs)}]")
+        print(f"  Available slugs (current scope):  [{', '.join(current_slugs)}]", file=out)
     if global_metadata:
         global_names = list(global_metadata.keys())
-        print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]")
+        print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]", file=out)
     rw = entry.get("read_when", [])
     refs = entry.get("references", [])
     desc = entry.get("description", "")
-    print("  Status:")
+    print("  Status:", file=out)
     if not desc.strip():
-        print(f"    description  ✗  required, min 20 chars")
+        print(f"    description  ✗  required, min 20 chars", file=out)
     else:
-        print(f"    description  (review)  {desc[:70]}")
+        print(f"    description  (review)  {desc[:70]}", file=out)
     if not rw:
-        print(f"    read_when    ✗  required, min 1 phrase, max 8")
+        print(f"    read_when    ✗  required, min 1 phrase, max 8", file=out)
     else:
-        print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}")
+        print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}", file=out)
     if refs:
-        print(f"    references   (review)  {refs}")
+        print(f"    references   (review)  {refs}", file=out)
     else:
-        print(f"    references   [empty]  optional, max 10")
-    print(f"  Next:  $SM --set-metadata {slug} <<'EOF' ...")
+        print(f"    references   [empty]  optional, max 10", file=out)
+    print(f"  Next:  $SM set-metadata {slug} <<'EOF' ...", file=out)
     return 0
 
 
@@ -167,7 +206,7 @@ def cmd_set_metadata(mem_dir, slug):
     metadata = common.read_metadata(jsonl_path)
 
     if slug not in metadata:
-        print(f"{slug}: no metadata entry. Run sync-memory first.", file=sys.stderr)
+        print(f"{slug}: no metadata entry. Run sync-memory sync first.", file=sys.stderr)
         return 1
 
     try:
@@ -289,6 +328,381 @@ def cmd_audit(mem_dir):
     return 0
 
 
+def _display_graph(mem_dir, metadata, emit, no_mermaid=False):
+    """Knowledge graph view: mermaid graph LR of slugs + references."""
+    scores, in_degree = common.compute_scores(metadata)
+    if no_mermaid:
+        _graph_as_table(metadata, in_degree, emit)
+        return
+
+    nodes = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
+    emit("## 知识图谱")
+    if len(nodes) > 50:
+        emit(f"<!-- {len(nodes)} nodes, may render densely in Feishu -->")
+    emit("```mermaid")
+    emit("graph LR")
+    for n in nodes:
+        out_deg = len(metadata[n].get("references", []))
+        if in_degree.get(n, 0) >= 3:
+            emit(f'    {n}(["{n}"])')          # 枢纽:圆角矩形 + 加粗
+        elif in_degree.get(n, 0) > 0 or out_deg > 0:
+            emit(f'    {n}["{n}"]')            # 有连接:方框
+        else:
+            emit(f'    {n}("{n}")')            # 孤立:圆角
+    emit()
+    for a in nodes:
+        for b in metadata[a].get("references", []):
+            # b 已剔除 exclude 与自引用(在 cmd_display 中完成)
+            # global: 前缀边跨 scope,标签原样输出含 global:B;本 scope 边无前缀。
+            emit(f'    {a} --> {b}')
+    emit("```")
+
+
+def _graph_as_table(metadata, in_degree, emit):
+    """--no-mermaid fallback: adjacency list table."""
+    emit("## 知识图谱(邻接表形式)")
+    emit()
+    emit("| 节点 | 引用(出边) | 被引用(入边) |")
+    emit("|------|------------|--------------|")
+    for a in sorted(metadata.keys()):
+        out = metadata[a].get("references", [])
+        in_cnt = in_degree.get(a, 0)
+        out_str = ", ".join(out) if out else "—"
+        in_str = f"{in_cnt}" if in_cnt else "— (孤立)" if not out else "—"
+        emit(f"| {a} | {out_str} | {in_str} |")
+
+
+def _display_stats(mem_dir, metadata, emit):
+    """Overview stats view: markdown table of counts + Top 5 hot list."""
+    scores, in_degree = common.compute_scores(metadata)
+    total = len(metadata)
+    with_refs = [e for e in metadata.values() if e.get("references")]
+    edges = sum(len(e.get("references", [])) for e in metadata.values())
+    cross = sum(1 for e in metadata.values() for r in e.get("references", []) if r.startswith("global:"))
+    hubs = sorted((n for n, d in in_degree.items() if d >= 3), key=lambda n: n)
+    avg = f"{edges / total:.2f}" if total else "0.00"
+    isolates = [n for n, e in metadata.items() if in_degree.get(n, 0) == 0 and not e.get("references")]
+    # 预计算每个 slug 的引用集合(去除 global: 前缀),避免双向检查时 O(n²) 重建列表
+    refs_clean = {
+        n: {r.replace("global:", "", 1) for r in metadata[n].get("references", [])}
+        for n in metadata
+    }
+    bidir = set()
+    for a in metadata:
+        for r in metadata[a].get("references", []):
+            clean = r.replace("global:", "", 1)
+            if clean in metadata and a in refs_clean.get(clean, set()):
+                bidir.add(tuple(sorted((a, clean))))
+    top = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
+    best = top[0] if top else None
+
+    emit("## 全景统计")
+    emit()
+    emit("| 指标 | 数值 |")
+    emit("|------|------|")
+    emit(f"| 记忆总数 | {total} |")
+    emit(f"| 有引用的记忆数 | {len(with_refs)} |")
+    emit(f"| 引用边总数 | {edges} |")
+    emit(f"| 跨 scope 边数 | {cross} |")
+    emit(f"| 枢纽节点(入度≥3) | {len(hubs)} ({', '.join(hubs)}) |" if hubs else f"| 枢纽节点(入度≥3) | 0 |")
+    emit(f"| 平均出度 | {avg} |")
+    emit(f"| 孤立节点数 | {len(isolates)} |")
+    emit(f"| 双向引用对数 | {len(bidir)} |")
+    if best:
+        emit(f"| 最高分记忆 | {best} ({scores[best]:.1f}) |")
+    else:
+        emit("| 最高分记忆 | — |")
+    topics = _topic_groups(list(metadata.keys()))
+    topic_str = ", ".join(f"{k} ({len(v)})" for k, v in topics.items()) if topics else "—"
+    emit(f"| 覆盖技术主题 | {len(topics)} ({topic_str}) — 按 slug 前缀自动分组 |")
+
+    emit()
+    emit("### 热榜 Top 5(按引用分数排序)")
+    emit()
+    emit("| 排名 | 记忆 | 入度 | 出度 | 分数 |")
+    emit("|------|------|------|------|------|")
+    for i, n in enumerate(top[:5], 1):
+        out = len(metadata[n].get("references", []))
+        emit(f"| {i} | {n} | {in_degree.get(n, 0)} | {out} | {scores[n]:.1f} |")
+    coverage = f"{len(with_refs) / total * 100:.0f}%" if total else "0%"
+    emit()
+    emit(f"**覆盖率**:{coverage} 的记忆建立了引用关系,知识网络已形成初步骨架。分数 = 入度×2 + 出度×0.5,引用越多越核心。")
+
+
+def _topic_groups(slugs):
+    """Coarse grouping by slug prefix. Returns dict topic -> list of slugs."""
+    groups = {}
+    for s in slugs:
+        if s.startswith("onnx-"):
+            groups.setdefault("ONNX", []).append(s)
+        elif s.startswith(("cc-", "hook-")):
+            groups.setdefault("Claude Code", []).append(s)
+        elif s.startswith("archived-memory-"):
+            groups.setdefault("archived-memory", []).append(s)
+        elif s.startswith("git-"):
+            groups.setdefault("git", []).append(s)
+        elif s.startswith(("workflow-", "codex-")):
+            groups.setdefault("workflow", []).append(s)
+        else:
+            groups.setdefault("other", []).append(s)
+    return groups
+
+
+def _display_timeline(mem_dir, metadata, emit, no_mermaid=False):
+    """Accumulation timeline view: mermaid timeline by YYYY-MM buckets (mtime)."""
+    from datetime import datetime, timezone
+    buckets = {}  # YYYY-MM -> {day: [slug, ...]}
+    for slug in metadata:
+        path = os.path.join(mem_dir, f"{slug}.md")
+        if not os.path.exists(path):
+            continue
+        ts = os.path.getmtime(path)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        key = dt.strftime("%Y-%m")
+        day = f"{dt.month}月{dt.day}日"
+        buckets.setdefault(key, {}).setdefault(day, []).append(slug)
+    if not buckets:
+        emit("## 积累时间线")
+        emit()
+        emit("> 记忆库为空,暂无时间线数据。")
+        return
+
+    if no_mermaid:
+        _timeline_as_table(buckets, emit)
+        return
+
+    emit("## 积累时间线")
+    emit("```mermaid")
+    emit("timeline")
+    emit("    title 记忆积累时间线")
+    for month in sorted(buckets):
+        emit(f"    section {month}")
+        for day in sorted(buckets[month], key=lambda d: (int(d.split("月")[0]), int(d.split("月")[1].rstrip("日")))):
+            slugs = sorted(buckets[month][day])
+            for i, s in enumerate(slugs):
+                prefix = f"        {day} :" if i == 0 else "              :"
+                emit(f"{prefix} {s}")
+    emit("```")
+
+
+def _timeline_as_table(buckets, emit):
+    """--no-mermaid fallback: month -> count -> slug list."""
+    emit("## 积累时间线")
+    emit()
+    emit("| 月份 | 当月活跃记忆数 | 记忆列表 |")
+    emit("|------|--------------|---------|")
+    for month in sorted(buckets):
+        day_slugs = sorted(s for day in buckets[month] for s in buckets[month][day])
+        emit(f"| {month} | {len(day_slugs)} | {', '.join(day_slugs)} |")
+
+
+def _resolve_hot_target_for_read(scope, cwd=None):
+    """Resolve hot list file path for reading.
+    In test mode (_MEMORY_SYNC_TEST_DIR set), redirect to test dir's mock file,
+    symmetric with cmd_sync's test-mode skip: sync skips write, display redirects read."""
+    test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+    if test_dir:
+        # global scope → <test_dir>/CLAUDE.md;project scope → <test_dir>/MEMORY.md
+        if scope == "global":
+            return os.path.join(test_dir, "CLAUDE.md")
+        return os.path.join(test_dir, "MEMORY.md")
+    return common.get_hot_list_target(scope, cwd=cwd)
+
+
+def _display_usage(mem_dir, metadata, emit, no_mermaid=False, args=None, scope=None):
+    """Usage effect view: hot score bar chart + real hot list block + demo script."""
+    scores, in_degree = common.compute_scores(metadata)
+    top10 = sorted(metadata.keys(), key=lambda n: (-scores[n], n))[:10]
+
+    if no_mermaid:
+        emit("## 使用效果流")
+        emit()
+        emit("### 热榜分数分布(Top 10)")
+        emit()
+        emit("| 排名 | 记忆 | 分数 | 入度 | 出度 |")
+        emit("|------|------|------|------|------|")
+        for i, n in enumerate(top10, 1):
+            out = len(metadata[n].get("references", []))
+            emit(f"| {i} | {n} | {scores[n]:.1f} | {in_degree.get(n, 0)} | {out} |")
+    else:
+        _usage_bar_chart(top10, scores, emit)
+
+    _usage_hotlist_block(mem_dir, metadata, emit, scope=scope)
+    _usage_demo_script(emit)
+
+
+def _usage_bar_chart(top10, scores, emit):
+    """xychart-beta bar chart of top-10 scores."""
+    emit("## 使用效果流")
+    emit()
+    emit("### 热榜分数分布(Top 10)")
+    emit("```mermaid")
+    emit('xychart-beta')
+    emit('    title "热榜分数分布(Top 10)"')
+    slugs = ", ".join(f'"{s}"' for s in top10)
+    emit(f'    x-axis [{slugs}]')
+    emit('    y-axis "分数" 0 --> 8')
+    bars = ", ".join(f"{scores[n]:.1f}" for n in top10)
+    emit(f"    bar [{bars}]")
+    emit("```")
+
+
+def _usage_hotlist_block(mem_dir, metadata, emit, scope=None):
+    """Read real hot list block from CLAUDE.md (or test-mock), filter excluded slugs."""
+    # scope 来源:由 cmd_display 统一解析后传入(args.scope 显式 > 路径推断 > 测试模式 global)。
+    # 测试模式(_MEMORY_SYNC_TEST_DIR set)下 mock 热榜文件写在 <test_dir>/CLAUDE.md
+    # (global target),所以 scope 传 "global" 使读取重定向到该文件。
+    if scope is None:
+        test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+        if test_dir:
+            scope = "global"
+        else:
+            global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
+            scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
+    hot_target = _resolve_hot_target_for_read(scope, cwd=mem_dir)
+    emit("### 自动召回:双层机制")
+    emit()
+    emit("**热层(零操作自动加载)**")
+    emit()
+    emit("Claude Code 启动时自动加载 CLAUDE.md,其中 memory-index 块由 sync 自动注入。")
+    emit("当前热榜(Top 10,按引用分数排序,自动写入):")
+    emit()
+    if os.path.exists(hot_target):
+        with open(hot_target, "r") as f:
+            content = f.read()
+        start = content.find(common.HOT_LIST_MARKER_START)
+        end = content.find(common.HOT_LIST_MARKER_END)
+        if start != -1 and end != -1 and end > start:
+            block = content[start + len(common.HOT_LIST_MARKER_START):end]
+            matched = False
+            for line in block.splitlines():
+                # 只输出含 metadata 中 slug 的行(exclude 已从 metadata 剔除)
+                if any(f"[{s}]" in line or f"({s})" in line for s in metadata):
+                    emit(line)
+                    matched = True
+            if not matched:
+                emit("> 热榜块中没有匹配的记忆条目。")
+        else:
+            emit("> 未找到 memory-index 热榜块,运行 $SM sync 后重试")
+    else:
+        emit("> 未找到 memory-index 热榜块,运行 $SM sync 后重试")
+    emit()
+    emit("**温层(按需 grep)**")
+    emit()
+    emit("当任务涉及特定主题时,Claude 主动 grep INDEX.md 的 read-when 字段匹配关键词,")
+    emit("再按需读取对应记忆文件。例如任务提及\"ONNX 量化\",命中 onnx-qdq-quant-param-detection 的 read-when 短语。")
+
+
+def _usage_demo_script(emit):
+    """Fixed demo script text (not dynamic data)."""
+    emit("### 演示脚本(可照着跑)")
+    emit()
+    emit("以下命令可在任何已安装 memory-lifecycle 的机器上复现:")
+    emit()
+    emit('1. 定义命令缩写:`SM="python3 $HOME/.claude/skills/memory-lifecycle/scripts/memory-sync.py"`')
+    emit("2. 查看全景统计:`$SM display --view stats`")
+    emit("3. 生成知识图谱(贴 Feishu 自动渲染):`$SM display --view graph`")
+    emit("4. 查看积累时间线:`$SM display --view timeline`")
+    emit("5. 查看完整演示(四视图合一):`$SM display --view all`")
+    emit("6. 脱敏:排除含内部细节的记忆:`$SM display --exclude codex-workflow,cc-memory-injection`")
+    emit("7. 验证引用图健康度(对外展示前自查):`$SM audit`")
+    emit()
+    emit("> 截图说明:以上命令的终端输出截图由文档维护者人工补充。mermaid 代码块直接粘贴到 Feishu 即可自动渲染为图形。")
+
+
+def cmd_display(mem_dir, args):
+    """Read-only: output Markdown + Mermaid visualization for Feishu docs.
+    Never writes to disk; never triggers sync; never touches the hot list."""
+    if not os.path.isdir(mem_dir):
+        print(f"ERROR: memory dir not found: {mem_dir}", file=sys.stderr)
+        return 2
+    views = args.view.split(",") if args.view != "all" else ["graph", "stats", "timeline", "usage"]
+    exclude_set = set(args.exclude.split(",")) if args.exclude else set()
+    out = sys.stdout
+    if args.out:
+        parent = os.path.dirname(os.path.abspath(args.out))
+        try:
+            os.makedirs(parent, exist_ok=True)
+            out = open(args.out, "w", encoding="utf-8")
+        except OSError as e:
+            print(f"ERROR: cannot write to --out '{args.out}': {e}", file=sys.stderr)
+            return 2
+
+    def emit(text=""):
+        print(text, file=out)
+
+    try:
+        jsonl_path = get_jsonl_path(mem_dir)
+        metadata = common.read_metadata(jsonl_path)  # {} if missing
+
+        # scope 解析(与 main() 的 --scope 覆盖一致):显式 > 路径推断 > 测试模式 global。
+        # 传给 _display_usage → _usage_hotlist_block,统一热榜读取的 scope 来源。
+        if getattr(args, "scope", "auto") in ("global", "project"):
+            scope = args.scope
+        else:
+            test_dir = os.environ.get("_MEMORY_SYNC_TEST_DIR")
+            if test_dir:
+                scope = "global"
+            else:
+                global_mem = os.path.realpath(os.path.expanduser("~/.claude/global/memory"))
+                scope = "global" if os.path.realpath(mem_dir).startswith(global_mem) else "project"
+
+        # Stale metadata detection: metadata has entries whose .md files were deleted.
+        # Warn (read-only, no auto-cleanup) so the user knows to run sync.
+        if metadata:
+            md_files = {
+                f[:-3] for f in os.listdir(mem_dir)
+                if f.endswith(".md") and f not in ("INDEX.md", "MEMORY.md", "README.md")
+            }
+            stale = [n for n in metadata if n not in md_files]
+            if stale:
+                print(
+                    f"WARNING: metadata has {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'} "
+                    f"({', '.join(sorted(stale))}) with no .md file. Run $SM sync to clean up.",
+                    file=sys.stderr,
+                )
+
+        # exclude 过滤:剔除 slug + 剔除指向被排除 slug 的边(避免悬空边)
+        for slug in list(exclude_set):
+            if slug not in metadata:
+                print(f"WARNING: exclude slug '{slug}' not found, ignored", file=sys.stderr)
+        for slug in exclude_set:
+            metadata.pop(slug, None)
+        for name, entry in metadata.items():
+            entry["references"] = [
+                r for r in entry.get("references", [])
+                if r.replace("global:", "", 1) not in exclude_set
+            ]
+
+        # 防御:拒绝自引用(metadata 校验已禁止,但脏数据时跳过)
+        for name, entry in metadata.items():
+            entry["references"] = [r for r in entry.get("references", []) if r.replace("global:", "", 1) != name]
+
+        if not metadata:
+            # 空库或全部被 exclude 排空 → 空状态占位
+            emit("## 知识图谱\n\n> 记忆库为空,暂无节点与引用。先运行 $SM sync 初始化。\n")
+            emit("## 全景统计\n\n| 指标 | 数值 |\n|------|------|\n| 记忆总数 | 0 |\n| 引用边总数 | 0 |\n")
+            emit("## 积累时间线\n\n> 记忆库为空,暂无时间线数据。\n")
+            emit("## 使用效果流\n\n> 记忆库为空。写入第一条记忆后重新运行 display 查看效果。")
+            return 0
+
+        for view in views:
+            if view == "graph":
+                _display_graph(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+            elif view == "stats":
+                _display_stats(mem_dir, metadata, emit)
+            elif view == "timeline":
+                _display_timeline(mem_dir, metadata, emit, no_mermaid=args.no_mermaid)
+            elif view == "usage":
+                _display_usage(mem_dir, metadata, emit, no_mermaid=args.no_mermaid, args=args, scope=scope)
+
+        return 0
+    finally:
+        # 确保文件句柄在任何路径(含异常)下都关闭;stdout 无需关闭。
+        if args.out and out is not sys.stdout:
+            out.close()
+
+
 def main():
     parser = argparse.ArgumentParser(prog="sync-memory", description="Memory lifecycle sync engine v2.1")
     sub = parser.add_subparsers(dest="command")
@@ -296,8 +710,9 @@ def main():
     sync_p = sub.add_parser("sync", help="Full sync: scan .md, update metadata, rebuild INDEX, update hot list")
     sync_p.add_argument("--dry-run", action="store_true", help="Validate only, no writes")
     sync_p.add_argument("--scope-from-file", type=str, help="Pin scope from file path")
+    sub.add_parser("sync-and-hint", help="DEPRECATED: use sync + hint as separate hooks")
     hint_p = sub.add_parser("hint", help="Show metadata hints for a memory")
-    hint_p.add_argument("slug")
+    hint_p.add_argument("slug", nargs="?", help="Memory slug")
     set_p = sub.add_parser("set-metadata", help="Batch write metadata from stdin JSON")
     set_p.add_argument("slug")
     del_p = sub.add_parser("delete", help="Delete a memory and clean dangling refs")
@@ -305,27 +720,109 @@ def main():
     del_p.add_argument("--dry-run", action="store_true", help="Validate only, no writes")
     del_p.add_argument("--scope-from-file", type=str, help="Pin scope from file path")
     sub.add_parser("audit", help="Structural audit of the memory graph")
+    disp_p = sub.add_parser("display", help="Read-only: output Feishu-pasteable visualization (graph/stats/timeline/usage)")
+    disp_p.add_argument("--view", default="all", choices=["graph", "stats", "timeline", "usage", "all"],
+                        help="View to output (default: all)")
+    disp_p.add_argument("--scope", default="auto", choices=["global", "project", "auto"],
+                        help="Memory scope (default: auto-detect)")
+    disp_p.add_argument("--exclude", default="", help="Comma-separated slugs to filter out")
+    disp_p.add_argument("--out", default="", help="Write output to file (default: stdout)")
+    disp_p.add_argument("--no-mermaid", action="store_true", help="Degrade mermaid blocks to markdown tables")
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         return 1
 
-    mem_dir = get_mem_dir(scope_from_file=getattr(args, 'scope_from_file', None))
-    os.makedirs(mem_dir, exist_ok=True)
+    # PostToolUse hook pipes tool result JSON to stdin. sync and hint both
+    # consume it (for scope + slug). Each hook gets its own independent pipe.
+    hook_data = None
+    scope_file = getattr(args, 'scope_from_file', None)
+    if args.command in ("sync", "hint", "sync-and-hint") and not sys.stdin.isatty() and not scope_file:
+        import select
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            try:
+                data = json.load(sys.stdin)
+                if data.get("hook_event_name"):
+                    hook_data = data
+                    scope_file = data.get("tool_input", {}).get("file_path", "")
+            except Exception:
+                pass
+
+    # Guard: if the hook fired for a non-memory file (pathPattern mismatch in
+    # the hook system), silently exit 0 to avoid spurious "file not found" errors.
+    if hook_data and scope_file and not _is_under_memory_dir(scope_file):
+        return 0
+
+    mem_dir = get_mem_dir(scope_from_file=scope_file) if scope_file else get_mem_dir()
+    if args.command == "display":
+        # --scope 显式覆盖 CWD 检测(spec §2.1);测试模式(_MEMORY_SYNC_TEST_DIR)优先于 --scope,
+        # 因 get_mem_dir 在测试模式下已返回 test_dir,这里不覆盖,保持现有测试行为。
+        if getattr(args, "scope", "auto") in ("global", "project") and not os.environ.get("_MEMORY_SYNC_TEST_DIR"):
+            mem_dir = common.get_memory_dir(args.scope)
+    else:
+        os.makedirs(mem_dir, exist_ok=True)
 
     dry_run = getattr(args, 'dry_run', False)
 
     if args.command == "sync":
         return cmd_sync(mem_dir, dry_run=dry_run, scope_from_file=args.scope_from_file)
+    elif args.command == "sync-and-hint":
+        # DEPRECATED — kept for compatibility only, use sync + hint hooks instead.
+        ret = cmd_sync(mem_dir, dry_run=dry_run, scope_from_file=scope_file)
+        if ret != 0:
+            return ret
+        if not scope_file:
+            return 0
+        slug = os.path.splitext(os.path.basename(scope_file))[0]
+        cmd_hint(mem_dir, slug, hook_mode=True)
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": (
+                    f"🔴 MEMORY METADATA REVIEW NEEDED for '{slug}' 🔴\n"
+                    f"You just wrote to this memory file. Its metadata (description, "
+                    f"read_when, references) may not reflect the latest content.\n"
+                    f"Run: $SM set-metadata {slug} <<'EOF' ..."
+                )
+            }
+        }))
+        return 1
     elif args.command == "hint":
-        return cmd_hint(mem_dir, args.slug)
+        # From hook: stdin has file_path; from CLI: args.slug.
+        fp = args.slug
+        if not fp and hook_data:
+            fp = hook_data.get("tool_input", {}).get("file_path", "")
+        if not fp:
+            print("hint: no file path. Run $SM hint <slug>.", file=sys.stderr)
+            return 1
+
+        slug = os.path.splitext(os.path.basename(fp))[0]
+        cmd_hint(mem_dir, slug, hook_mode=bool(hook_data))
+
+        if hook_data:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": (
+                        f"🔴 MEMORY METADATA REVIEW NEEDED for '{slug}' 🔴\n"
+                        f"You just wrote to this memory file. Its metadata (description, "
+                        f"read_when, references) may not reflect the latest content.\n"
+                        f"Run: $SM set-metadata {slug} <<'EOF' ..."
+                    )
+                }
+            }))
+            return 1
+        # Manual mode: actual errors (file not found, not in metadata)
+        return 0
     elif args.command == "set-metadata":
         return cmd_set_metadata(mem_dir, args.slug)
     elif args.command == "delete":
         return cmd_delete(mem_dir, args.slug, dry_run=dry_run, scope_from_file=args.scope_from_file)
     elif args.command == "audit":
         return cmd_audit(mem_dir)
+    elif args.command == "display":
+        return cmd_display(mem_dir, args)
     return 0
 
 

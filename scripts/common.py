@@ -74,8 +74,11 @@ def _find_git_root(path):
 
 
 def detect_scope(cwd=None):
-    """Walk from cwd upward. .git found -> 'project', else 'global'."""
-    cwd = cwd or os.getcwd()
+    """Walk from cwd upward. .git found -> 'project', else 'global'.
+    Paths under ~/.claude/ are always global (skills, configs, etc.)."""
+    cwd = os.path.expanduser(cwd or os.getcwd())
+    if cwd.startswith(os.path.expanduser("~/.claude/")):
+        return "global"
     return "project" if _find_git_root(cwd) else "global"
 
 

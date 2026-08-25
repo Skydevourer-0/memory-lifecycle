@@ -42,7 +42,7 @@ class TestDisplayCLIBase(unittest.TestCase):
     def _make_hotlist_file(self, content):
         # 在 _MEMORY_SYNC_TEST_DIR 下写 mock 热榜文件(测试模式重定向目标)
         path = os.path.join(self.mem_dir, "CLAUDE.md")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -423,16 +423,14 @@ class TestDisplayIntegration(TestDisplayCLIBase):
 
     def test_out_file_unwritable(self):
         self._setup_full()
-        # 只读目录模拟:父目录不可写 → open 失败 → exit 2 + ERROR on stderr
-        ro_dir = os.path.join(self.tmp.name, "ro")
-        os.makedirs(ro_dir)
-        os.chmod(ro_dir, 0o444)
-        try:
-            result = self._run("display", "--view", "graph", "--out", os.path.join(ro_dir, "x.md"))
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("ERROR", result.stderr)
-        finally:
-            os.chmod(ro_dir, 0o755)
+        # 父路径是文件而非目录 → os.makedirs 失败 → exit 2 + ERROR on stderr
+        # (Windows 上 os.chmod 只读属性不可靠,不采用只读目录模拟)
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("not a dir")
+        result = self._run("display", "--view", "graph", "--out", os.path.join(blocker, "x.md"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR", result.stderr)
 
     def test_scope_global_explicit(self):
         self._setup_full()
@@ -447,37 +445,39 @@ class TestDisplayIntegration(TestDisplayCLIBase):
         self.assertEqual(result.returncode, 0)
 
     def test_scope_explicit_overrides_auto(self):
-        # Finding 1 修复验证:`--scope global` 显式传参必须覆盖 CWD 自动检测。
-        # 现有 _run 设 _MEMORY_SYNC_TEST_DIR 使 get_mem_dir 返回 test_dir,
-        # 而 --scope 修复后测试模式优先于 scope——所以此测试需在非测试模式下验证。
-        # 方案:在临时项目目录(有 .git,auto 检测会判 project)下运行,
-        # 不设 _MEMORY_SYNC_TEST_DIR,用 `--scope global` 覆盖 → 读真实全局库。
-        # 断言 stdout 含真实全局库的已知 slug,证明 mem_dir 指向 global 而非 project。
+        # `--scope global` 显式传参必须覆盖 CWD 自动检测。
+        # 方案:临时 HOME 种入全局库,在带 .git 的项目目录下运行
+        # 且不设 _MEMORY_SYNC_TEST_DIR,用 `--scope global` 覆盖 → 读临时全局库。
         project_tmp = tempfile.TemporaryDirectory()
+        home_tmp = tempfile.TemporaryDirectory()
         try:
             project_dir = project_tmp.name
-            # 模拟项目目录:有 .git → auto 检测为 project
             os.makedirs(os.path.join(project_dir, ".git"))
+            global_dir = os.path.join(home_tmp.name, ".cc-switch", "memory", "global")
+            os.makedirs(global_dir)
+            with open(os.path.join(global_dir, "seed-topic.md"), "w", encoding="utf-8") as f:
+                f.write("# Seed\n\nContent.")
+            with open(os.path.join(global_dir, "metadata.jsonl"), "w", encoding="utf-8") as f:
+                json.dump({"name": "seed-topic", "description": "Seed memory for scope test.",
+                           "read_when": ["seed topic"], "references": []}, f, ensure_ascii=False)
+                f.write("\n")
             env = os.environ.copy()
-            # 关键:不设 _MEMORY_SYNC_TEST_DIR,让 --scope 真正生效
             env.pop("_MEMORY_SYNC_TEST_DIR", None)
-            # CWD 设为项目目录(影响 detect_scope / get_memory_dir 的 cwd 推断)
+            env["HOME"] = home_tmp.name
+            env["USERPROFILE"] = home_tmp.name
             proc = subprocess.run(
                 [sys.executable, MEMORY_SYNC, "display", "--scope", "global", "--view", "stats"],
                 capture_output=True, text=True, env=env, cwd=project_dir,
             )
             self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
-            # 真实全局库含已知 slug(preferences/security/onnx-shape-inference 等),
-            # 若 --scope global 未生效则会读 project 目录(空)或 test_dir(未设)→ 无这些 slug。
-            # 用宽松断言:只要输出含 "全景统计" 表头且记忆总数 > 0,即证明读了非空全局库。
             self.assertIn("## 全景统计", proc.stdout)
-            # 全局库当前有 19 条记忆(随使用变化,断言 > 0 即可)
             import re
             m = re.search(r"\| 记忆总数 \| (\d+) \|", proc.stdout)
             self.assertIsNotNone(m, f"记忆总数行未找到: {proc.stdout}")
-            self.assertGreater(int(m.group(1)), 0, f"--scope global 未读到全局库: {proc.stdout}")
+            self.assertGreater(int(m.group(1)), 0, f"--scope global 未读到临时全局库: {proc.stdout}")
         finally:
             project_tmp.cleanup()
+            home_tmp.cleanup()
 
     def test_empty_memory_dir(self):
         # 只有空 memory 目录,无 .md 无 jsonl
@@ -530,3 +530,80 @@ class TestDisplayIntegration(TestDisplayCLIBase):
         result = self._run("display", "--view", "usage")
         self.assertIn("Alpha description here.", result.stdout)
         self.assertNotIn("真实~/.claude/CLAUDE.md", result.stdout)  # 未访问真实文件
+
+
+class TestDisplayDualRead(unittest.TestCase):
+    """usage 视图全局热榜双读:CLAUDE.md + AGENTS.md 都读取并标注来源。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = os.path.join(self.tmp.name, "home")
+        self.global_dir = os.path.join(self.home, ".cc-switch", "memory", "global")
+        os.makedirs(self.global_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed_memory(self):
+        with open(os.path.join(self.global_dir, "alpha.md"), "w", encoding="utf-8") as f:
+            f.write("# Alpha\n\nContent.")
+        with open(os.path.join(self.global_dir, "metadata.jsonl"), "w", encoding="utf-8") as f:
+            json.dump({"name": "alpha", "description": "Alpha memory for testing.",
+                       "read_when": ["alpha topic"], "references": []}, f, ensure_ascii=False)
+            f.write("\n")
+
+    def _write_marker_file(self, rel, entry_desc):
+        path = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("<!-- memory-index:start -->\n")
+            f.write(f"- [alpha](alpha.md) — {entry_desc}\n")
+            f.write("<!-- memory-index:end -->\n")
+
+    def test_usage_dual_read_annotates_sources(self):
+        self._seed_memory()
+        self._write_marker_file(os.path.join(".claude", "CLAUDE.md"), "Claude-side description.")
+        self._write_marker_file(os.path.join(".codex", "AGENTS.md"), "Codex-side description.")
+        env = os.environ.copy()
+        env.pop("_MEMORY_SYNC_TEST_DIR", None)
+        env["HOME"] = self.home
+        env["USERPROFILE"] = self.home
+        proc = subprocess.run(
+            [sys.executable, MEMORY_SYNC, "display", "--view", "usage"],
+            capture_output=True, text=True, env=env, cwd=self.home,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("来源:", proc.stdout)
+        self.assertIn("CLAUDE.md", proc.stdout)
+        self.assertIn("AGENTS.md", proc.stdout)
+        self.assertIn("Claude-side description.", proc.stdout)
+        self.assertIn("Codex-side description.", proc.stdout)
+
+    def test_usage_project_reads_hotlist(self):
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        slug = None
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import common as cm
+        slug = cm.project_slug(repo)
+        mem_dir = os.path.join(self.home, ".cc-switch", "memory", "projects", slug)
+        os.makedirs(mem_dir)
+        with open(os.path.join(mem_dir, "alpha.md"), "w", encoding="utf-8") as f:
+            f.write("# Alpha\n\nContent.")
+        with open(os.path.join(mem_dir, "metadata.jsonl"), "w", encoding="utf-8") as f:
+            json.dump({"name": "alpha", "description": "Alpha memory for testing.",
+                       "read_when": ["alpha topic"], "references": []}, f, ensure_ascii=False)
+            f.write("\n")
+        with open(os.path.join(mem_dir, "HOTLIST.md"), "w", encoding="utf-8") as f:
+            f.write("- [alpha](alpha.md) — Project hotlist description.\n")
+        env = os.environ.copy()
+        env.pop("_MEMORY_SYNC_TEST_DIR", None)
+        env["HOME"] = self.home
+        env["USERPROFILE"] = self.home
+        proc = subprocess.run(
+            [sys.executable, MEMORY_SYNC, "display", "--view", "usage"],
+            capture_output=True, text=True, env=env, cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Project hotlist description.", proc.stdout)
+        self.assertIn("HOTLIST.md", proc.stdout)

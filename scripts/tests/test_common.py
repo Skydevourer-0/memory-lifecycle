@@ -1,8 +1,29 @@
+# -*- coding: utf-8 -*-
 import json
 import os
 import tempfile
 import unittest
+
 import common
+
+
+def _with_env(home):
+    """Return env copy with HOME/USERPROFILE pointed at temp home."""
+    env = os.environ.copy()
+    env["HOME"] = home
+    env["USERPROFILE"] = home
+    env.pop("CODEX_HOME", None)
+    return env
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _read(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 class TestJsonlIO(unittest.TestCase):
@@ -14,8 +35,7 @@ class TestJsonlIO(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_read_empty_jsonl(self):
-        with open(self.jsonl_path, "w") as f:
-            pass  # create empty file
+        _write(self.jsonl_path, "")
         result = common.read_metadata(self.jsonl_path)
         self.assertEqual(result, {})
 
@@ -39,6 +59,16 @@ class TestJsonlIO(unittest.TestCase):
             pass
         result = common.read_metadata(self.jsonl_path)
         self.assertEqual(result["my-topic"]["description"], "old")
+
+    def test_write_overwrites_existing_target_atomically(self):
+        # os.replace semantics: destination already exists -> must succeed.
+        first = {"a": {"name": "a", "description": "first", "read_when": [], "references": []}}
+        common.write_all_metadata(self.jsonl_path, first)
+        second = {"b": {"name": "b", "description": "second", "read_when": [], "references": []}}
+        common.write_all_metadata(self.jsonl_path, second)
+        result = common.read_metadata(self.jsonl_path)
+        self.assertEqual(list(result.keys()), ["b"])
+        self.assertEqual(result["b"]["description"], "second")
 
     def test_remove_entry(self):
         common.write_metadata(self.jsonl_path, "a", {"name": "a", "description": "d", "read_when": [], "references": []})
@@ -70,6 +100,55 @@ class TestSlugValidation(unittest.TestCase):
         self.assertFalse(common.validate_slug("--"))
 
 
+class TestProjectSlug(unittest.TestCase):
+    def test_windows_path_folded(self):
+        # 统一 slug 算法:C:\Users\a\proj -> c-users-a-proj(折叠连续 '-')
+        self.assertEqual(common.project_slug(r"C:\Users\a\proj"), "c-users-a-proj")
+
+    def test_posix_path(self):
+        # Windows 上 realpath 会补盘符,期望值按同一算法从 realpath 计算
+        real = os.path.realpath("/home/user/code/my-project")
+        lowered = real.lower()
+        replaced = common.re.sub(r"[^a-z0-9]", "-", lowered)
+        expected = common.re.sub(r"-+", "-", replaced).strip("-")
+        self.assertEqual(common.project_slug("/home/user/code/my-project"), expected)
+
+    def test_slug_always_valid(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            slug = common.project_slug(tmp.name)
+            self.assertTrue(common.validate_slug(slug))
+            self.assertEqual(slug, slug.lower())
+        finally:
+            tmp.cleanup()
+
+    def test_get_memory_dir_project_uses_folded_slug(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            os.makedirs(os.path.join(tmp.name, ".git"))
+            mem_dir = common.get_memory_dir("project", cwd=tmp.name)
+            expected = os.path.join(
+                os.path.expanduser("~/.cc-switch/memory/projects"),
+                common.project_slug(tmp.name),
+            )
+            self.assertEqual(os.path.normcase(mem_dir), os.path.normcase(expected))
+        finally:
+            tmp.cleanup()
+
+
+class TestCodexHome(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("CODEX_HOME", None)
+
+    def test_env_var_wins(self):
+        os.environ["CODEX_HOME"] = r"C:\custom\codex-home"
+        self.assertEqual(common.codex_home(), r"C:\custom\codex-home")
+
+    def test_default_is_codex_dir(self):
+        os.environ.pop("CODEX_HOME", None)
+        self.assertEqual(common.codex_home(), os.path.expanduser("~/.codex"))
+
+
 class TestScopeDetection(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -85,17 +164,102 @@ class TestScopeDetection(unittest.TestCase):
         os.makedirs(git_dir)
         self.assertEqual(common.detect_scope(cwd=self.tmp.name), "project")
 
-    def test_scope_from_global_file(self):
+    def test_project_scope_with_git_file_worktree(self):
+        git_file = os.path.join(self.tmp.name, ".git")
+        _write(git_file, "gitdir: /elsewhere/.git/worktrees/x\n")
+        self.assertEqual(common.detect_scope(cwd=self.tmp.name), "project")
+        self.assertEqual(common._find_git_root(self.tmp.name), self.tmp.name)
+
+    def test_scope_from_global_file_new_prefix(self):
+        result = common.detect_scope_from_file(
+            os.path.expanduser("~/.cc-switch/memory/global/foo.md")
+        )
+        self.assertEqual(result, "global")
+
+    def test_scope_from_project_file_new_prefix(self):
+        result = common.detect_scope_from_file(
+            os.path.expanduser("~/.cc-switch/memory/projects/foo-bar/slug.md")
+        )
+        self.assertEqual(result, "project")
+
+    def test_scope_from_old_global_prefix_migrate_only(self):
         result = common.detect_scope_from_file(
             os.path.expanduser("~/.claude/global/memory/foo.md")
         )
         self.assertEqual(result, "global")
 
-    def test_scope_from_project_file(self):
+    def test_scope_from_old_project_prefix_migrate_only(self):
         result = common.detect_scope_from_file(
-            "/home/user/projects/foo/.claude/projects/foo-bar/memory/slug.md"
+            os.path.expanduser("~/.claude/projects/foo-bar/memory/slug.md")
         )
         self.assertEqual(result, "project")
+
+    def test_scope_from_unknown_path_none(self):
+        self.assertIsNone(common.detect_scope_from_file("/tmp/unrelated/file.md"))
+
+    def test_skills_dir_always_global(self):
+        home = os.path.join(self.tmp.name, "home")
+        skills = os.path.join(home, ".cc-switch", "skills", "memory-lifecycle")
+        os.makedirs(os.path.join(skills, ".git"))
+        saved_home = os.environ.get("HOME")
+        saved_profile = os.environ.get("USERPROFILE")
+        os.environ["HOME"] = home
+        os.environ["USERPROFILE"] = home
+        try:
+            self.assertEqual(common.detect_scope(cwd=skills), "global")
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_profile is None:
+                os.environ.pop("USERPROFILE", None)
+            else:
+                os.environ["USERPROFILE"] = saved_profile
+
+    def test_skills_like_sibling_not_global(self):
+        # 路径边界:~/.cc-switch-skills 不应被误判为 global
+        home = os.path.join(self.tmp.name, "home")
+        sibling = os.path.join(home, ".cc-switch-skills", "proj")
+        os.makedirs(os.path.join(sibling, ".git"))
+        saved_home = os.environ.get("HOME")
+        saved_profile = os.environ.get("USERPROFILE")
+        os.environ["HOME"] = home
+        os.environ["USERPROFILE"] = home
+        try:
+            self.assertEqual(common.detect_scope(cwd=sibling), "project")
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_profile is None:
+                os.environ.pop("USERPROFILE", None)
+            else:
+                os.environ["USERPROFILE"] = saved_profile
+
+
+class TestResolveMemDirFromFile(unittest.TestCase):
+    def test_global_new_prefix(self):
+        path = os.path.expanduser("~/.cc-switch/memory/global/foo.md")
+        self.assertEqual(
+            os.path.normcase(common.resolve_mem_dir_from_file(path)),
+            os.path.normcase(os.path.expanduser("~/.cc-switch/memory/global")),
+        )
+
+    def test_project_new_prefix(self):
+        path = os.path.expanduser("~/.cc-switch/memory/projects/my-proj/sub/x.md")
+        self.assertEqual(
+            os.path.normcase(common.resolve_mem_dir_from_file(path)),
+            os.path.normcase(os.path.expanduser("~/.cc-switch/memory/projects/my-proj")),
+        )
+
+    def test_old_prefixes_none(self):
+        self.assertIsNone(common.resolve_mem_dir_from_file(os.path.expanduser("~/.claude/global/memory/foo.md")))
+        self.assertIsNone(common.resolve_mem_dir_from_file("/home/u/.claude/projects/x/memory/y.md"))
+
+    def test_unknown_path_none(self):
+        self.assertIsNone(common.resolve_mem_dir_from_file("/tmp/unrelated.md"))
 
 
 class TestValidationGates(unittest.TestCase):
@@ -109,6 +273,20 @@ class TestValidationGates(unittest.TestCase):
         for word in ["TBD", "todo", "PLACEHOLDER", "WIP", "draft"]:
             self.assertIsNotNone(
                 common.validate_description(word).get("error")
+            )
+
+    def test_description_blacklist_chinese(self):
+        for word in ["记住", "记一下", "重要", "备忘", "笔记", "总结", "概述", "相关信息", "待补充"]:
+            self.assertIsNotNone(
+                common.validate_description(word).get("error"),
+                f"{word} 应在黑名单中",
+            )
+
+    def test_description_boilerplate_chinese(self):
+        for text in ["这是关于部署的记忆", "描述了系统架构", "一些调试的笔记"]:
+            self.assertIsNotNone(
+                common.validate_description(text).get("error"),
+                f"{text} 应命中 boilerplate",
             )
 
     def test_description_valid(self):
@@ -147,6 +325,12 @@ class TestValidationGates(unittest.TestCase):
         self.assertIsNone(
             common.validate_read_when(["debugging cost display", "token tracking"]).get("error")
         )
+
+    def test_duplicate_read_when_detected(self):
+        self.assertEqual(common.duplicate_read_when(["a phrase", "A Phrase", "b phrase"]), ["A Phrase"])
+
+    def test_duplicate_read_when_empty(self):
+        self.assertEqual(common.duplicate_read_when(["a phrase", "b phrase"]), [])
 
     def test_references_too_many(self):
         refs = [f"slug-{i}" for i in range(11)]
@@ -237,14 +421,12 @@ class TestInjectHotList(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_injects_content_between_markers(self):
-        with open(self.target, "w") as f:
-            f.write("before\n<!-- memory-index:start -->\nold\n<!-- memory-index:end -->\nafter\n")
+        _write(self.target, "before\n<!-- memory-index:start -->\nold\n<!-- memory-index:end -->\nafter\n")
         metadata = {"a": {"name": "a", "description": "A memory",
                            "read_when": ["x"], "references": []}}
         result = common.inject_hot_list(self.target, metadata)
         self.assertTrue(result)
-        with open(self.target, "r") as f:
-            content = f.read()
+        content = _read(self.target)
         self.assertIn("A memory", content)
         self.assertNotIn("old", content)
         self.assertIn("before", content)
@@ -255,10 +437,49 @@ class TestInjectHotList(unittest.TestCase):
         self.assertFalse(result)
 
     def test_returns_false_when_markers_missing(self):
-        with open(self.target, "w") as f:
-            f.write("no markers here")
+        _write(self.target, "no markers here")
         result = common.inject_hot_list(self.target, {"a": {"name": "a", "description": "d", "read_when": [], "references": []}})
         self.assertFalse(result)
+
+    def test_standalone_full_write_no_markers(self):
+        target = os.path.join(self.tmp.name, "HOTLIST.md")
+        _write(target, "stale old content\n")
+        metadata = {
+            "a": {"name": "a", "description": "Alpha memory description", "read_when": [], "references": []},
+            "b": {"name": "b", "description": "Beta memory description", "read_when": [], "references": []},
+        }
+        result = common.inject_hot_list(target, metadata, standalone=True)
+        self.assertTrue(result)
+        content = _read(target)
+        self.assertNotIn("stale", content)
+        self.assertNotIn("memory-index:start", content)
+        self.assertIn("[a](a.md)", content)
+        self.assertIn("[b](b.md)", content)
+        self.assertTrue(content.endswith("\n"))
+
+    def test_standalone_overwrites_existing_target(self):
+        # os.replace:目标已存在时覆盖成功(Windows os.rename 会抛 FileExistsError)
+        target = os.path.join(self.tmp.name, "HOTLIST.md")
+        _write(target, "first\n")
+        metadata = {"a": {"name": "a", "description": "A memory", "read_when": [], "references": []}}
+        common.inject_hot_list(target, metadata, standalone=True)
+        common.inject_hot_list(target, metadata, standalone=True)  # 第二次覆盖
+        self.assertIn("A memory", _read(target))
+
+    def test_hot_list_budget_1200(self):
+        metadata = {}
+        for i in range(50):
+            slug = f"mem-{i:03d}"
+            metadata[slug] = {
+                "name": slug,
+                "description": "这是一条比较长的记忆描述用于测试字符预算上限是否生效 " * 5,
+                "read_when": [],
+                "references": [],
+            }
+        lines = common.hot_list_lines(metadata)
+        total = sum(len(l) + 1 for l in lines)
+        self.assertLessEqual(total, common.HOTLIST_BUDGET)
+        self.assertLessEqual(len(lines), len(metadata))
 
 
 class TestEnsureMarkers(unittest.TestCase):
@@ -270,25 +491,40 @@ class TestEnsureMarkers(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_appends_markers_when_missing(self):
-        with open(self.target, "w") as f:
-            f.write("existing content\n")
+        _write(self.target, "existing content\n")
         result = common.ensure_markers(self.target)
         self.assertTrue(result)
-        with open(self.target, "r") as f:
-            content = f.read()
+        content = _read(self.target)
         self.assertIn("existing content", content)
         self.assertIn("<!-- memory-index:start -->", content)
         self.assertIn("<!-- memory-index:end -->", content)
 
     def test_returns_false_when_markers_present(self):
-        with open(self.target, "w") as f:
-            f.write("<!-- memory-index:start -->\n<!-- memory-index:end -->\n")
+        _write(self.target, "<!-- memory-index:start -->\n<!-- memory-index:end -->\n")
         result = common.ensure_markers(self.target)
         self.assertFalse(result)
 
     def test_returns_false_when_file_missing(self):
         result = common.ensure_markers("/nonexistent/file.md")
         self.assertFalse(result)
+
+
+class TestGetHotListTarget(unittest.TestCase):
+    def test_global_dual_targets(self):
+        targets = common.get_hot_list_target("global")
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(targets[0].endswith("CLAUDE.md"))
+        self.assertTrue(targets[1].endswith("AGENTS.md"))
+
+    def test_project_hotlist(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            os.makedirs(os.path.join(tmp.name, ".git"))
+            target = common.get_hot_list_target("project", cwd=tmp.name)
+            self.assertTrue(target.endswith(os.path.join("HOTLIST.md")))
+            self.assertIn(os.path.join("projects", common.project_slug(tmp.name)), target)
+        finally:
+            tmp.cleanup()
 
 
 class TestValidateSetMetadataJson(unittest.TestCase):

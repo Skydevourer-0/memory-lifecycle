@@ -1,17 +1,75 @@
 #!/usr/bin/env python3
-"""memory-lifecycle sync engine — v2.2 (Claude Code + Codex dual-platform).
+"""memory-lifecycle sync engine — v2.3 (Claude Code + Codex dual-platform).
 
 Data SSOT: ~/.cc-switch/memory/{global,projects/<slug>}.
 Hooks: PostToolUse sync-and-hint (soft hint, exit 0) + SessionStart session-start.
 """
 
+import os
+import sys
+import time
+
+# ── Fast pre-filter (PostToolUse hot path) ──────────────────────────────────────────────────────────────
+# Windows hook schemas have no path-level filter (Claude Code `if` globs are
+# basename-only; Codex has no `if`/pathPattern at all), so the PostToolUse hook
+# fires on EVERY file edit. To keep the no-op cost near the Python interpreter
+# floor instead of importing the whole engine, we read the payload here and
+# exit before `import common` when it provably cannot be a memory write. The
+# buffered bytes are handed to the engine afterwards (no double read).
+
+_HOOK_PREFIX_BUF = None  # bytes already read from stdin by the fast pre-filter
+
+
+def _read_hook_prefix():
+    """Bounded non-blocking read of the full hook payload.
+
+    Returns the bytes read (possibly b""), or None on I/O failure (fail-open).
+    Reads until EOF or a short deadline; a real hook call has the payload fully
+    written before the hook process starts, so EOF arrives immediately.
+    """
+    try:
+        if sys.stdin.isatty():
+            return None
+        fd = sys.stdin.fileno()
+        os.set_blocking(fd, False)
+        buf = bytearray()
+        deadline = time.monotonic() + 0.25
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    chunk = os.read(fd, 1 << 16)
+                except BlockingIOError:
+                    time.sleep(0.001)
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass
+        return bytes(buf)
+    except (BlockingIOError, OSError, ValueError):
+        return None
+
+
+# Fast path: for the PostToolUse hook command, skip the engine when the payload
+# provably contains no memory path. Every path the precise guard accepts carries
+# the literal dir segment "memory" (~/.cc-switch/memory/... or
+# ~/.claude/projects/<slug>/memory/...), and the payload always includes the
+# resolved path (or the cwd used to resolve it). Empty payload -> run the engine
+# (its existing no-op path exits 0). Case-insensitive on purpose.
+if len(sys.argv) >= 2 and sys.argv[1] == "sync-and-hint":
+    _HOOK_PREFIX_BUF = _read_hook_prefix()
+    if _HOOK_PREFIX_BUF and b"memory" not in _HOOK_PREFIX_BUF.lower():
+        sys.exit(0)
+
 import argparse
 import json
-import os
 import queue
 import re
 import shutil
-import sys
 import threading
 
 # Ensure the scripts directory is importable
@@ -80,10 +138,18 @@ def _parse_payload_bytes(raw):
 
 
 def _load_hook_payload():
-    """Read + parse hook payload from stdin (blocking, short timeout)."""
+    """Read + parse hook payload from stdin (blocking, short timeout).
+
+    Uses the bytes already buffered by the fast pre-filter when present, so the
+    payload is never read twice."""
     if sys.stdin.isatty():
         return None, False
-    raw = _read_pipe_stdin()
+    global _HOOK_PREFIX_BUF
+    if _HOOK_PREFIX_BUF is not None:
+        raw = _HOOK_PREFIX_BUF
+        _HOOK_PREFIX_BUF = None
+    else:
+        raw = _read_pipe_stdin()
     if raw is None:
         return None, True
     return _parse_payload_bytes(raw)
@@ -127,8 +193,8 @@ def _is_under_memory_dir(filepath):
     Native auto-memory territory (~/.claude/projects/<slug>/memory) is NOT
     matched here — it is routed to _import_native_memory instead. The old
     ~/.claude/global/memory layout is legacy skill territory (migrate only)."""
-    expanded = os.path.abspath(os.path.expanduser(filepath))
-    root = os.path.abspath(os.path.expanduser("~/.cc-switch/memory"))
+    expanded = common._normalized(filepath)
+    root = common._normalized("~/.cc-switch/memory")
     return expanded.startswith(root + os.sep)
 
 
@@ -138,8 +204,8 @@ NATIVE_SOURCE = "native"
 def _is_native_memory_path(filepath):
     """True for files under Claude Code's native auto-memory territory:
     ~/.claude/projects/<slug>/memory/. Only this form counts."""
-    expanded = os.path.abspath(os.path.expanduser(filepath))
-    projects_root = os.path.abspath(os.path.expanduser("~/.claude/projects"))
+    expanded = common._normalized(filepath)
+    projects_root = common._normalized("~/.claude/projects")
     if not expanded.startswith(projects_root + os.sep):
         return False
     rel = expanded[len(projects_root + os.sep):]

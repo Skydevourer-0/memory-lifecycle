@@ -551,11 +551,11 @@ class TestHookFailOpen(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "")
 
     def test_exception_fail_open(self):
-        # 相对路径 + cwd 非字符串 → 内部异常 → stderr + 空 stdout + exit 0
+        # 含 memory 路径通过快速过滤 + cwd 非字符串 → 引擎内部异常 → stderr + 空 stdout + exit 0
         payload = json.dumps({
             "hook_event_name": "PostToolUse",
             "cwd": {"x": 1},
-            "tool_input": {"command": "*** Begin Patch\n*** Update File: foo.md\n*** End Patch"},
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: .cc-switch/memory/global/foo.md\n*** End Patch"},
         })
         r = subprocess.run(
             [sys.executable, MEMORY_SYNC, "sync-and-hint"],
@@ -565,6 +565,22 @@ class TestHookFailOpen(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "")
         self.assertIn("hook error", r.stderr)
+
+    def test_noop_payload_no_stderr_noise(self):
+        # 快速过滤跳过的 no-op:exit 0、空 stdout、且不产生 stderr 噪音
+        payload = json.dumps({
+            "hook_event_name": "PostToolUse",
+            "cwd": self.repo,
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: src/main.py\n*** End Patch"},
+        })
+        r = subprocess.run(
+            [sys.executable, MEMORY_SYNC, "sync-and-hint"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=_home_env(self.home), cwd=self.repo, input=payload,
+        )
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+        self.assertEqual(r.stderr.strip(), "")
 class TestSessionStart(unittest.TestCase):
     """session-start hook:注入项目 HOTLIST.md;无 git root / HOTLIST 缺失 → 空输出 exit 0。"""
 
@@ -792,3 +808,92 @@ class TestMigrate(unittest.TestCase):
         r = self._migrate()
         self.assertEqual(r.returncode, 0)
         self.assertIn("SKIP", r.stdout)
+
+
+class TestFastPreFilter(unittest.TestCase):
+    """v2.3 fast pre-filter: no-op hook payloads skip the engine before heavy
+    imports; memory payloads (case-insensitive) still pass through. Also covers
+    the normcase guard fix (differently-cased memory paths are recognized)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = os.path.join(self.tmp.name, "home")
+        self.mem_dir = os.path.join(self.home, ".cc-switch", "memory", "global")
+        os.makedirs(self.mem_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, payload, command="sync-and-hint", stdin_input=None):
+        return subprocess.run(
+            [sys.executable, MEMORY_SYNC, command],
+            capture_output=True, text=True, encoding="utf-8",
+            env=_home_env(self.home),
+            input=stdin_input if stdin_input is not None else json.dumps(payload),
+        )
+
+    def _make_md(self, slug):
+        _write(os.path.join(self.mem_dir, f"{slug}.md"), "# Test\n\nContent.")
+
+    def test_code_payload_skipped_no_output(self):
+        # 无 "memory" 子串的代码编辑 -> 快速路径直接 exit 0(不经过引擎)
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "cwd": self.home,
+            "tool_input": {
+                "command": "*** Begin Patch\n*** Update File: src/main.py\n@@ -1 +1 @@\n-print(1)\n+print(2)\n*** End Patch"
+            },
+        }
+        r = self._run(payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_code_payload_mentioning_memory_falls_through(self):
+        # diff 内容含 "memory" 但非记忆文件 -> 快速路径放行,精确守卫 exit 0
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "cwd": self.home,
+            "tool_input": {
+                "command": "*** Begin Patch\n*** Update File: src/cache.py\n@@ -1 +1 @@\n-# memory allocator\n+# faster memory allocator\n*** End Patch"
+            },
+        }
+        r = self._run(payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_uppercase_memory_path_processed(self):
+        # 大小写不同的记忆路径:快速路径 case-insensitive + normcase 守卫都通过 -> hint
+        self._make_md("alpha")
+        up = os.path.join(self.home, ".cc-switch", "MEMORY", "GLOBAL", "alpha.md")
+        payload = {"hook_event_name": "PostToolUse", "tool_input": {"file_path": up}}
+        r = self._run(payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("alpha", r.stdout)
+
+    def test_mixed_case_memory_path_processed(self):
+        # 整个路径大小写混合仍被识别
+        self._make_md("beta")
+        mixed = os.path.join(self.home, ".cc-SWITCH", "memory", "GLOBAL", "beta.md")
+        payload = {"hook_event_name": "PostToolUse", "tool_input": {"file_path": mixed}}
+        r = self._run(payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("beta", r.stdout)
+
+    def test_manual_no_stdin_exits_0(self):
+        # 手动调用(空 stdin)-> 快速路径放行,引擎 no-op exit 0
+        r = self._run(None, stdin_input="")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_session_start_unaffected(self):
+        # session-start 不走快速路径:payload 无 "memory" 子串也必须正常注入 HOTLIST
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        slug = common.project_slug(repo)
+        hotlist = os.path.join(self.home, ".cc-switch", "memory", "projects", slug, "HOTLIST.md")
+        os.makedirs(os.path.dirname(hotlist))
+        _write(hotlist, "- [alpha](alpha.md) \u2014 Alpha desc\n")
+        payload = {"hook_event_name": "SessionStart", "cwd": repo}
+        r = self._run(payload, command="session-start")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Alpha desc", r.stdout)

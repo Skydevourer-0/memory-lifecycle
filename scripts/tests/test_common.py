@@ -101,6 +101,7 @@ class TestSlugValidation(unittest.TestCase):
 
 
 class TestProjectSlug(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows path semantics only on Windows")
     def test_windows_path_folded(self):
         # 统一 slug 算法:C:\Users\a\proj -> c-users-a-proj(折叠连续 '-')
         self.assertEqual(common.project_slug(r"C:\Users\a\proj"), "c-users-a-proj")

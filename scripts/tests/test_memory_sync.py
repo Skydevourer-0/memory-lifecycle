@@ -44,7 +44,7 @@ class TestMemorySyncCLI(unittest.TestCase):
         env["_MEMORY_SYNC_TEST_DIR"] = self.mem_dir
         proc = subprocess.run(
             [sys.executable, MEMORY_SYNC] + list(args),
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, encoding="utf-8", env=env,
             input=stdin_input
         )
         return proc
@@ -159,7 +159,7 @@ class TestEndToEnd(unittest.TestCase):
         env["_MEMORY_SYNC_TEST_DIR"] = self.mem_dir
         return subprocess.run(
             [sys.executable, MEMORY_SYNC] + list(args),
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, encoding="utf-8", env=env,
             input=stdin_input
         )
 

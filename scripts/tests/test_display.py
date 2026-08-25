@@ -24,7 +24,7 @@ class TestDisplayCLIBase(unittest.TestCase):
         env["_MEMORY_SYNC_TEST_DIR"] = self.mem_dir
         proc = subprocess.run(
             [sys.executable, MEMORY_SYNC] + list(args),
-            capture_output=True, text=True, env=env, input=stdin_input,
+            capture_output=True, text=True, encoding="utf-8", env=env, input=stdin_input,
         )
         return proc
 
@@ -467,7 +467,7 @@ class TestDisplayIntegration(TestDisplayCLIBase):
             env["USERPROFILE"] = home_tmp.name
             proc = subprocess.run(
                 [sys.executable, MEMORY_SYNC, "display", "--scope", "global", "--view", "stats"],
-                capture_output=True, text=True, env=env, cwd=project_dir,
+                capture_output=True, text=True, encoding="utf-8", env=env, cwd=project_dir,
             )
             self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
             self.assertIn("## 全景统计", proc.stdout)
@@ -570,7 +570,7 @@ class TestDisplayDualRead(unittest.TestCase):
         env["USERPROFILE"] = self.home
         proc = subprocess.run(
             [sys.executable, MEMORY_SYNC, "display", "--view", "usage"],
-            capture_output=True, text=True, env=env, cwd=self.home,
+            capture_output=True, text=True, encoding="utf-8", env=env, cwd=self.home,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("来源:", proc.stdout)
@@ -602,7 +602,7 @@ class TestDisplayDualRead(unittest.TestCase):
         env["USERPROFILE"] = self.home
         proc = subprocess.run(
             [sys.executable, MEMORY_SYNC, "display", "--view", "usage"],
-            capture_output=True, text=True, env=env, cwd=repo,
+            capture_output=True, text=True, encoding="utf-8", env=env, cwd=repo,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Project hotlist description.", proc.stdout)

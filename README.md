@@ -111,7 +111,12 @@ AGENTS.md 合并上限 32 KiB（热榜约 1200 字符，影响极小）；`/clea
 命中记忆文件 → **exit 0 + additionalContext 软提示**（不阻断、无 emoji、无 🔴 REVIEW）。
 metadata 为空（刚 sync 的 stub）→ 提示"元数据待补（set-metadata）"。命中多个文件最多 3 条提示。
 Delete 分支 → 删除 + 清理引用 + 重建 INDEX 与热榜。基础设施文件（INDEX/MEMORY/README/HOTLIST）→ 跳过。
-守卫只认 `~/.cc-switch/memory/` 前缀；原生 auto-memory 路径与无关文件 → no-op exit 0。
+守卫只认 `~/.cc-switch/memory/` 前缀；无关文件 → no-op exit 0。
+Claude 端 PostToolUse 每个工具（Write/Edit/MultiEdit）带 `if: "<Tool>(*.md)"` 预过滤：
+非 .md 写入不 spawn 进程（实测 Windows 上 `if` 的 glob 只匹配文件名、目录段匹配失效，`*.md` 是可用上限）。
+**原生 auto-memory 写入（`~/.claude/projects/<slug>/memory/`）→ 单向摄取进管理库**（落点按会话 cwd 判定：
+git 根 → 项目库，无 git 根 → 全局库；原生文件不动；导入记忆带 `source: "native"` 标记，人工改动后不再被覆盖）。
+auto-dream 后台写入不触发 hook → 用 `$SM import-native` 回填。
 任何异常 → stderr + 空 stdout + exit 0（fail-open）；stdin 不完整 JSON → 空输出 exit 0，不 fallback 到 cwd scope。
 
 ## 命令
@@ -126,6 +131,7 @@ $SM audit                            # 结构审计(孤立节点、单向边)
 $SM display [--view graph|stats|timeline|usage|all] [--scope global|project|auto] [--exclude slug1,slug2] [--out <file>] [--no-mermaid]   # 只读:输出可贴 Feishu 的可视化素材
 $SM session-start                    # SessionStart hook:注入项目 HOTLIST.md
 $SM migrate                          # 一次性迁移旧 ~/.claude 数据(幂等,已存在跳过)
+$SM import-native                    # 回填当前项目的原生 auto-memory(auto-dream 后台写入不触发 hook)
 ```
 
 ## 迁移（可选）

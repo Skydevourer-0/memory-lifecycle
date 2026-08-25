@@ -32,7 +32,15 @@ def _write(path, text):
 
 
 def _all_commands(hooks_data, event):
-    return [h.get("command", "") for block in hooks_data.get(event, []) for h in block.get("hooks", [])]
+    return [
+        " ".join([h.get("command", ""), *(h.get("args") or [])])
+        for block in hooks_data.get(event, [])
+        for h in block.get("hooks", [])
+    ]
+
+
+def _all_hooks(hooks_data, event):
+    return [h for block in hooks_data.get(event, []) for h in block.get("hooks", [])]
 
 
 class TestClaudeInstaller(unittest.TestCase):
@@ -88,7 +96,8 @@ class TestClaudeInstaller(unittest.TestCase):
         self.assertTrue(any("sync-and-hint" in c for c in post_cmds))
         # 本技能块无 pathPattern
         for block in settings["hooks"]["PostToolUse"]:
-            if any("memory-sync.py" in h.get("command", "") for h in block.get("hooks", [])):
+            payloads = [" ".join([h.get("command", ""), *(h.get("args") or [])]) for h in block.get("hooks", [])]
+            if any("memory-sync.py" in p for p in payloads):
                 self.assertNotIn("pathPattern", block)
         session_cmds = _all_commands(settings["hooks"], "SessionStart")
         self.assertTrue(any("session-start" in c for c in session_cmds))
@@ -115,14 +124,35 @@ class TestClaudeInstaller(unittest.TestCase):
         self.assertTrue(os.path.isdir(os.path.join(self.home, ".cc-switch", "memory", "global")))
         self.assertTrue(os.path.isdir(os.path.join(self.home, ".cc-switch", "memory", "projects")))
 
-    def test_commands_unquoted_when_no_spaces(self):
-        # Windows cmd/CreateProcess fails when the executable name is quoted
-        # (Codex hooks). Paths without spaces must stay unquoted.
-        if " " not in sys.executable and " " not in SKILL_ROOT:
-            self._install()
-            settings = self._load_settings()
-            for cmd in _all_commands(settings["hooks"], "PostToolUse") + _all_commands(settings["hooks"], "SessionStart"):
-                self.assertFalse(cmd.startswith('"'), f"command must not start with a quote: {cmd}")
+    def test_hooks_use_exec_form(self):
+        # A command-string hook runs through Git Bash on Windows, which strips
+        # backslashes from D:\\... paths (D:\\scoop\\... -> D:scoop...) and
+        # breaks the hook. Hooks must use the args (exec) form: `command` is
+        # spawned directly with the argument list — no shell — so Windows
+        # paths survive verbatim, no quoting ever needed. PostToolUse entries
+        # are additionally gated by an `if` basename `*.md` filter so
+        # non-markdown writes never spawn the hook.
+        self._install()
+        settings = self._load_settings()
+
+        def _ours(h):
+            return "memory-sync.py" in " ".join([h.get("command", ""), *(h.get("args") or [])])
+
+        post_hooks = [h for h in _all_hooks(settings["hooks"], "PostToolUse") if _ours(h)]
+        session_hooks = [h for h in _all_hooks(settings["hooks"], "SessionStart") if _ours(h)]
+        self.assertEqual(len(post_hooks), 3, "one PostToolUse hook per file tool")
+        self.assertEqual(
+            {h.get("if") for h in post_hooks},
+            {"Write(*.md)", "Edit(*.md)", "MultiEdit(*.md)"},
+        )
+        for h in post_hooks + session_hooks:
+            self.assertEqual(h["type"], "command")
+            self.assertEqual(h["command"], sys.executable)
+            self.assertIsInstance(h.get("args"), list)
+            self.assertGreaterEqual(len(h["args"]), 2)
+            self.assertTrue(h["args"][0].endswith("memory-sync.py"))
+        for h in session_hooks:
+            self.assertNotIn("if", h)
 
 
 class TestCodexInstaller(unittest.TestCase):

@@ -28,7 +28,8 @@ APPLY_PATCH_FILE_RE = re.compile(r"^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+?)
 
 
 def _reconfigure_utf8():
-    """Hook mode: force UTF-8 on stdout/stderr (Windows default is GBK)."""
+    """Force UTF-8 on stdout/stderr for ALL modes (Windows locale defaults to
+    GBK, which breaks piped consumers and mixed-encoding output)."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")
@@ -123,12 +124,165 @@ def _load_hook_payload_peek():
 def _is_under_memory_dir(filepath):
     """Guard: only the new prefix ~/.cc-switch/memory/ counts.
 
-    Old prefixes (~/.claude/global/memory, ~/.claude/projects/<slug>/memory,
-    i.e. native auto-memory territory) are explicit no-ops so sync never
-    scans them. Old prefixes are only read by the migrate command."""
+    Native auto-memory territory (~/.claude/projects/<slug>/memory) is NOT
+    matched here — it is routed to _import_native_memory instead. The old
+    ~/.claude/global/memory layout is legacy skill territory (migrate only)."""
     expanded = os.path.abspath(os.path.expanduser(filepath))
     root = os.path.abspath(os.path.expanduser("~/.cc-switch/memory"))
     return expanded.startswith(root + os.sep)
+
+
+NATIVE_SOURCE = "native"
+
+
+def _is_native_memory_path(filepath):
+    """True for files under Claude Code's native auto-memory territory:
+    ~/.claude/projects/<slug>/memory/. Only this form counts."""
+    expanded = os.path.abspath(os.path.expanduser(filepath))
+    projects_root = os.path.abspath(os.path.expanduser("~/.claude/projects"))
+    if not expanded.startswith(projects_root + os.sep):
+        return False
+    rel = expanded[len(projects_root + os.sep):]
+    parts = rel.split(os.sep)
+    return len(parts) >= 2 and parts[1] == "memory"
+
+
+def _parse_native_memory(path):
+    """Parse a native auto-memory file. Returns (slug, description, body) or None.
+
+    Native format (frontmatter):
+        ---
+        name: <kebab-slug>
+        description: <one-line summary>
+        metadata:
+          type: user|feedback|project|reference
+        ---
+        <body>
+    Slug falls back to the filename when frontmatter omits it; files without
+    frontmatter are treated as body-only."""
+    basename = os.path.basename(path)
+    if not basename.endswith(".md") or basename in INFRA_FILES:
+        return None
+    slug = basename[:-3]
+    if not common.validate_slug(slug):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    description = ""
+    body = raw
+    text = raw.lstrip()
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            front = text[3:end]
+            body = text[end + 4:].lstrip("\n")
+            for line in front.splitlines():
+                if line.startswith("name:"):
+                    slug = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+            if not common.validate_slug(slug):
+                return None
+    return slug, description, body
+
+
+def _synthesize_read_when(slug, description):
+    """Derive read_when phrases from a native description (native memories
+    have no read_when field). Fallback: the slug itself (kebab slugs are
+    >= 10 chars for real names)."""
+    phrases = []
+    for part in re.split(r"[.,;:!?()]+", description):
+        part = part.strip()
+        if len(part) < 10:
+            continue
+        if not any(w.lower() not in common.STOPWORDS for w in part.split()):
+            continue
+        phrases.append(part)
+        if len(phrases) >= 2:
+            break
+    if not phrases and len(slug) >= 10:
+        phrases.append(slug)
+    if common.validate_read_when(phrases):
+        return []
+    return phrases
+
+
+def _import_native_memory(scope_file, base_cwd):
+    """One-way ingest of a native auto-memory file into the managed store.
+
+    Scope comes from the session cwd (git root -> project store; no git root
+    -> global store). The native file is left untouched. The managed copy is
+    updated in place only while the memory is still native-owned: a memory
+    the user has curated (no native marker, or metadata diverged from what
+    we imported) is never overwritten. Returns (ok, message); message is
+    None when nothing happened."""
+    parsed = _parse_native_memory(scope_file)
+    if parsed is None:
+        return False, None
+    slug, description, body = parsed
+    mem_dir = common.get_memory_dir(common.detect_scope(cwd=base_cwd), cwd=base_cwd)
+    os.makedirs(mem_dir, exist_ok=True)
+    md_path = os.path.join(mem_dir, f"{slug}.md")
+    jsonl_path = get_jsonl_path(mem_dir)
+    metadata = common.read_metadata(jsonl_path)
+    existing = metadata.get(slug)
+
+    if existing is not None:
+        if existing.get("source") != NATIVE_SOURCE:
+            return False, f"memory '{slug}' already managed manually; native copy left as-is"
+        if existing.get("imported_description") and existing.get("description") != existing.get("imported_description"):
+            return False, f"memory '{slug}' curated by user; native copy left as-is"
+
+    common.atomic_write_text(md_path, body if body.endswith("\n") else body + "\n")
+    entry = {
+        "name": slug,
+        "description": description,
+        "read_when": _synthesize_read_when(slug, description),
+        "references": (existing or {}).get("references", []),
+        "source": NATIVE_SOURCE,
+        "imported_description": description,
+    }
+    common.write_metadata(jsonl_path, slug, entry)
+    cmd_sync(mem_dir)
+    rel = os.path.relpath(mem_dir, os.path.expanduser("~"))
+    return True, f"记忆 {slug}.md 已从原生 auto-memory 摄取 -> ~/{rel}"
+
+
+def _native_memory_dir_for_cwd(cwd):
+    """Locate the native auto-memory dir for a cwd by computing Claude Code's
+    native slug form (sanitization: non-alnum -> '-', case kept, no folding)."""
+    real = os.path.realpath(cwd)
+    native_slug = re.sub(r"[^a-zA-Z0-9]", "-", real)
+    return os.path.join(os.path.expanduser("~/.claude/projects"), native_slug, "memory")
+
+
+def cmd_import_native():
+    """Backfill native auto-memory for the current project into the managed
+    store. Needed because auto-dream background writes never fire the
+    PostToolUse hook (real-time ingestion only sees agent tool writes)."""
+    cwd = os.getcwd()
+    native_dir = _native_memory_dir_for_cwd(cwd)
+    if not os.path.isdir(native_dir):
+        print("No native auto-memory directory for this project.", file=sys.stderr)
+        return 0
+    imported = 0
+    for fname in sorted(os.listdir(native_dir)):
+        path = os.path.join(native_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        ok, note = _import_native_memory(path, cwd)
+        if ok:
+            imported += 1
+        if note:
+            print(note)
+    if imported:
+        print(f"Imported {imported} native memory file(s).")
+    else:
+        print("No native memories imported.", file=sys.stderr)
+    return 0
 
 
 def get_mem_dir(scope_from_file=None):
@@ -305,8 +459,15 @@ def cmd_sync_and_hint(payload):
         return 0
     base = payload.get("cwd") or os.getcwd()
     hits = []
+    import_notes = []
     for fp, op in files:
         path = fp if os.path.isabs(fp) else os.path.join(base, fp)
+        if _is_native_memory_path(path):
+            # Native auto-memory write -> one-way ingest into the managed store.
+            _ok, note = _import_native_memory(path, base)
+            if note:
+                import_notes.append(note)
+            continue
         if not _is_under_memory_dir(path):
             continue
         mem_dir = common.resolve_mem_dir_from_file(path)
@@ -316,7 +477,7 @@ def cmd_sync_and_hint(payload):
         if slug in INFRA_SLUGS:
             continue
         hits.append((mem_dir, slug, op))
-    if not hits:
+    if not hits and not import_notes:
         return 0
 
     # Dedupe by (mem_dir, slug)
@@ -342,6 +503,8 @@ def cmd_sync_and_hint(payload):
         sys.stdout = real_stdout
 
     hints = []
+    for note in import_notes:
+        hints.append(note)
     for mem_dir, slug, _op in writes:
         hint = _build_soft_hint(mem_dir, slug)
         if hint:
@@ -1135,7 +1298,9 @@ def main():
     disp_p.add_argument("--no-mermaid", action="store_true", help="Degrade mermaid blocks to markdown tables")
     sub.add_parser("session-start", help="SessionStart hook: inject project HOTLIST.md via additionalContext")
     sub.add_parser("migrate", help="Migrate old ~/.claude data into ~/.cc-switch (idempotent)")
+    sub.add_parser("import-native", help="Backfill native auto-memory for the current project into the managed store")
     args = parser.parse_args()
+    _reconfigure_utf8()  # 所有模式统一 UTF-8 输出,避免 Windows GBK locale 破坏管道消费者
 
     if not args.command:
         parser.print_help()
@@ -1143,6 +1308,9 @@ def main():
 
     if args.command == "migrate":
         return cmd_migrate()
+
+    if args.command == "import-native":
+        return cmd_import_native()
 
     # Hook payload parsing. Commands that run only as hooks block-read with a
     # short timeout; dual-use commands peek for already-buffered data.
@@ -1160,9 +1328,6 @@ def main():
         # synced into a project scope).
         return 0
 
-    if payload is not None:
-        _reconfigure_utf8()
-
     if args.command == "session-start":
         return _run_hook_command(cmd_session_start, payload)
 
@@ -1172,9 +1337,9 @@ def main():
         if isinstance(tool_input, dict) and not scope_file:
             scope_file = tool_input.get("file_path") or None
 
-    # Guard: hook fired for a non-memory file (or native auto-memory territory)
-    # -> silent exit 0.
-    if payload and scope_file and not _is_under_memory_dir(scope_file):
+    # Guard: hook fired for a non-memory file -> silent exit 0.
+    # Native auto-memory files are ingested instead (see cmd_sync_and_hint).
+    if payload and scope_file and not _is_under_memory_dir(scope_file) and not _is_native_memory_path(scope_file):
         return 0
 
     if args.command == "sync-and-hint":

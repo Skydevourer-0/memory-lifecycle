@@ -36,18 +36,40 @@ def _atomic_write_json(path, data):
     os.replace(tmp_path, path)
 
 
-def _is_ours(command):
-    return "memory-sync.py" in (command or "")
+def _hook_payload(hook):
+    """Flatten command + args of a hook for matching. Handles both the new
+    exec-form hooks and legacy command-string hooks."""
+    if not isinstance(hook, dict):
+        return ""
+    return " ".join([hook.get("command", ""), *(hook.get("args") or [])])
 
 
-def _fmt_cmd(python_exe, script, *args):
-    """Build a hook command. Quote a path only when it contains spaces:
-    Windows cmd / CreateProcess fails when the executable name itself is
-    quoted (e.g. Codex hooks), while a quoted path with spaces works on
-    Claude Code. Unquoted paths work everywhere."""
-    def _q(p):
-        return f'"{p}"' if " " in p else p
-    return " ".join([_q(python_exe), _q(script), *args])
+def _is_ours(hook):
+    return "memory-sync.py" in _hook_payload(hook)
+
+
+POST_TOOLS = ("Write", "Edit", "MultiEdit")
+
+
+def _build_hook(python_exe, script, *args):
+    """Build a single Claude Code hook in exec (args) form: `command` is
+    spawned directly with the argument list, never through a shell. On
+    Windows a plain command string runs through Git Bash, which strips
+    backslashes (D:\\scoop\\... -> D:scoop...), so Windows paths must never
+    reach a shell parser. Args form also removes the need for quoting."""
+    return {"type": "command", "command": python_exe, "args": [script, *args]}
+
+
+def _build_hooks(python_exe, script, *args):
+    """PostToolUse hooks: one entry per file tool, each gated by an `if`
+    basename filter `*.md` so non-markdown writes never spawn the hook.
+    Note: the `if` glob matches basenames only on Windows (directory globs
+    fail against backslash paths), but `*.md` still excludes all code
+    writes; the script guard remains the authoritative filter."""
+    return [
+        {"type": "command", "command": python_exe, "if": f"{tool}(*.md)", "args": [script, *args]}
+        for tool in POST_TOOLS
+    ]
 
 
 def _cleanup_blocks(blocks):
@@ -61,7 +83,7 @@ def _cleanup_blocks(blocks):
             continue
         hooks = block.get("hooks")
         if isinstance(hooks, list):
-            remaining = [h for h in hooks if not (isinstance(h, dict) and _is_ours(h.get("command", "")))]
+            remaining = [h for h in hooks if not _is_ours(h)]
         else:
             remaining = hooks
         block["hooks"] = remaining
@@ -69,31 +91,42 @@ def _cleanup_blocks(blocks):
             continue  # block became empty (ours) -> drop
         # 旧 pathPattern 只属于本技能旧块;有本技能 hook 的块不再需要它
         if block.get("pathPattern") == OLD_PATH_PATTERN and any(
-            isinstance(h, dict) and _is_ours(h.get("command", "")) for h in remaining
+            _is_ours(h) for h in remaining
         ):
             block.pop("pathPattern", None)
         cleaned.append(block)
     return cleaned
 
 
-def _ensure_command(blocks, command):
-    """Append a new matcher block with the command, unless an identical command
-    already exists (idempotent). Never merges into other skills' blocks."""
+def _ensure_hooks(blocks, new_hooks):
+    """Append a new matcher block with the hooks, unless every hook already
+    exists in some block (idempotent). Never merges into other skills'
+    blocks."""
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        hooks = block.get("hooks")
-        if isinstance(hooks, list) and any(
-            isinstance(h, dict) and h.get("command") == command for h in hooks
-        ):
+        existing = block.get("hooks")
+        if not isinstance(existing, list):
+            continue
+        missing = [
+            h for h in new_hooks
+            if not any(
+                isinstance(x, dict)
+                and x.get("command") == h["command"]
+                and x.get("args") == h.get("args")
+                and x.get("if") == h.get("if")
+                for x in existing
+            )
+        ]
+        if not missing:
             return False
-    blocks.append({"matcher": None, "hooks": [{"type": "command", "command": command}]})
+    blocks.append({"matcher": None, "hooks": list(new_hooks)})
     return True
 
 
-def _set_block_matcher(blocks, matcher, command):
-    """Ensure a block with the given matcher + command exists."""
-    if _ensure_command(blocks, command):
+def _set_block_matcher(blocks, matcher, hooks):
+    """Ensure a block with the given matcher + hooks exists."""
+    if _ensure_hooks(blocks, hooks):
         blocks[-1]["matcher"] = matcher
     return True
 
@@ -123,10 +156,10 @@ def main():
     hooks["SessionStart"] = _cleanup_blocks(session)
 
     python_exe = sys.executable
-    post_cmd = _fmt_cmd(python_exe, SCRIPT, "sync-and-hint")
-    session_cmd = _fmt_cmd(python_exe, SCRIPT, "session-start")
-    _set_block_matcher(hooks["PostToolUse"], POST_MATCHER, post_cmd)
-    _set_block_matcher(hooks["SessionStart"], SESSION_MATCHER, session_cmd)
+    post_hooks = _build_hooks(python_exe, SCRIPT, "sync-and-hint")
+    session_hook = _build_hook(python_exe, SCRIPT, "session-start")
+    _set_block_matcher(hooks["PostToolUse"], POST_MATCHER, post_hooks)
+    _set_block_matcher(hooks["SessionStart"], SESSION_MATCHER, [session_hook])
 
     _atomic_write_json(settings_path, settings)
 

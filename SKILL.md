@@ -67,14 +67,23 @@ PostToolUse hook runs `$SM sync-and-hint` once per tool call. It parses the payl
 lines), syncs the affected memory scope, then emits a **soft, non-blocking
 additionalContext hint** (exit 0, no emoji, no blocking review). Up to 3 hints per call.
 
+Claude-side PostToolUse entries (one per Write/Edit/MultiEdit) carry an
+`if: "<Tool>(*.md)"` filter so non-markdown writes never spawn the hook. The
+`if` glob matches basenames only on Windows (directory globs fail against
+backslash paths — verified empirically), so `*.md` is the strongest usable
+filter; the script guard remains the authoritative per-path filter.
+
 - Memory file written → hint shows `read-when` and reminds you to refresh metadata
   when the body changed.
 - Metadata empty (fresh stub) → hint says the memory exists and metadata is pending.
 - `INDEX.md` / `MEMORY.md` / `README.md` / `HOTLIST.md` → silently skipped.
 - Delete branch → memory removed, refs cleaned, INDEX + hot list rebuilt. Infrastructure
   files or unknown slugs → no-op.
-- Non-memory paths, native auto-memory paths (Claude legacy project memory dirs),
-  or broken payloads → silent exit 0 (fail-open).
+- **Native auto-memory write** (`~/.claude/projects/<slug>/memory/*.md`) → one-way
+  ingested into the managed store (scope from session cwd; native file untouched;
+  imported memories carry `source: "native"` and stop auto-updating once curated).
+- Non-memory paths, legacy `~/.claude/global/memory` paths, or broken payloads →
+  silent exit 0 (fail-open).
 
 Manual use: `$SM hint <slug>` — shows headings, refs, slugs, required fields.
 
@@ -155,4 +164,5 @@ $SM display [--view graph|stats|timeline|usage|all] [--scope global|project|auto
             # read-only: emit paste-into-Feishu visual artifacts (knowledge graph / stats / timeline / usage)
 $SM session-start                   # SessionStart hook: inject project HOTLIST.md
 $SM migrate                         # one-time migration from old ~/.claude layout (idempotent)
+$SM import-native                   # backfill native auto-memory for the current project (auto-dream writes never fire hooks)
 ```

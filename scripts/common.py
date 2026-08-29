@@ -109,14 +109,22 @@ def _normalized(path):
 def detect_scope(cwd=None):
     """Walk from cwd upward. .git found -> 'project', else 'global'.
 
-    Paths under ~/.claude/ and ~/.cc-switch/skills/ are always global
-    (skills, configs, etc.). Boundary checks use the OS separator and
-    normcase (expanduser may yield mixed / and \\ separators on Windows,
-    and the filesystem is case-insensitive) so ~/.cc-switch-foo is not
-    misclassified and real skills dirs are not missed."""
+    Paths under the agents' own config/skill homes (~/.claude/,
+    ~/.cc-switch/skills, ~/.zcode/skills, ~/.agents/skills,
+    ~/.config/opencode/skills) are always global (skills, configs, etc.).
+    Boundary checks use the OS separator and normcase (expanduser may yield
+    mixed / and \\ separators on Windows, and the filesystem is
+    case-insensitive) so ~/.cc-switch-foo is not misclassified and real
+    skills dirs are not missed."""
     cwd = os.path.expanduser(cwd or os.getcwd())
     normalized = _normalized(cwd)
-    for special in ("~/.claude", "~/.cc-switch/skills"):
+    for special in (
+        "~/.claude",
+        "~/.cc-switch/skills",
+        "~/.zcode/skills",
+        "~/.agents/skills",
+        "~/.config/opencode/skills",
+    ):
         base = _normalized(os.path.expanduser(special))
         if normalized == base or normalized.startswith(base + os.sep):
             return "global"
@@ -313,16 +321,26 @@ def validate_set_metadata_json(data, slug, current_scope_slugs, global_slugs=Non
     return {}
 
 
+def zcode_installed():
+    """True when a ZCode home exists (~/.zcode). Gates the ZCode hot-list
+    target so a Claude/Codex-only machine never grows a stray ~/.zcode/AGENTS.md."""
+    return os.path.isdir(os.path.expanduser("~/.zcode"))
+
+
 def get_hot_list_target(scope, cwd=None):
     """Return hot list target(s) for the given scope.
 
-    global -> list [~/.claude/CLAUDE.md, <codex_home>/AGENTS.md] (dual-end injection)
+    global -> list [~/.claude/CLAUDE.md, <codex_home>/AGENTS.md]
+             (+ ~/.zcode/AGENTS.md when a ZCode home exists — three-end injection)
     project -> str <mem_dir>/HOTLIST.md (SessionStart injection, no markers)"""
     if scope == "global":
-        return [
+        targets = [
             os.path.expanduser("~/.claude/CLAUDE.md"),
             os.path.join(codex_home(), "AGENTS.md"),
         ]
+        if zcode_installed():
+            targets.append(os.path.expanduser("~/.zcode/AGENTS.md"))
+        return targets
     cwd = cwd or os.getcwd()
     return os.path.join(get_memory_dir(scope, cwd), "HOTLIST.md")
 

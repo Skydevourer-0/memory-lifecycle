@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""memory-lifecycle sync engine — v2.3 (Claude Code + Codex dual-platform).
+"""memory-lifecycle sync engine — v2.3 (Claude Code + Codex + ZCode).
 
 Data SSOT: ~/.cc-switch/memory/{global,projects/<slug>}.
 Hooks: PostToolUse sync-and-hint (soft hint, exit 0) + SessionStart session-start.
@@ -124,15 +124,29 @@ def _parse_payload_bytes(raw):
     """Parse hook payload bytes. Returns (payload, invalid).
 
     invalid=True means stdin carried bytes that are not a valid hook payload
-    (incomplete JSON, wrong shape, missing hook_event_name) — callers must
-    fail open (empty stdout, exit 0) and NEVER fall back to CWD scope."""
+    (incomplete JSON, wrong shape, no recognized hook keys) — callers must
+    fail open (empty stdout, exit 0) and NEVER fall back to CWD scope.
+
+    Key recognition is platform-tolerant: Claude Code always carries
+    `hook_event_name`; Codex and ZCode payloads may differ in casing or omit
+    it (ZCode emits Claude-style events but the input contract is not
+    documented), so any dict carrying a known hook key
+    (hook_event_name/hookEventName/tool_input/toolInput/tool_name/toolName/
+    cwd/session_id/source) is accepted."""
     if not raw or not raw.strip():
         return None, False
     try:
         data = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return None, True
-    if not isinstance(data, dict) or not data.get("hook_event_name"):
+    if not isinstance(data, dict):
+        return None, True
+    known = (
+        "hook_event_name", "hookEventName",
+        "tool_input", "toolInput", "tool_name", "toolName",
+        "cwd", "session_id", "source",
+    )
+    if not any(k in data for k in known):
         return None, True
     return data, False
 
@@ -498,14 +512,21 @@ def _build_soft_hint(mem_dir, slug):
 def _parse_hook_files(payload):
     """Extract (path, op) pairs from a hook payload.
 
-    Claude Write/Edit/MultiEdit: tool_input.file_path (op='write').
-    Codex apply_patch: tool_input.command lines '*** (Update|Add|Delete) File: <path>'
-    (multiple files supported; relative paths resolved later against payload cwd)."""
-    files = []
+    Claude Code / ZCode Write|Edit (ZCode aliases apply_patch onto Write/
+    Edit matchers): tool_input.file_path (op='write').
+    Codex apply_patch: tool_input.command lines '*** (Update|Add|Delete)
+    File: <path>' (multiple files supported; relative paths resolved later
+    against payload cwd). tool_input/toolInput both accepted — ZCode's input
+    contract is not documented, camelCase is cheap insurance."""
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
-        return files
+        tool_input = payload.get("toolInput")
+    if not isinstance(tool_input, dict):
+        return []
+    files = []
     file_path = tool_input.get("file_path")
+    if not isinstance(file_path, str):
+        file_path = tool_input.get("filePath")
     if isinstance(file_path, str) and file_path.strip():
         files.append((file_path.strip(), "write"))
     command = tool_input.get("command")
@@ -1338,7 +1359,7 @@ def _run_hook_command(fn, *args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="sync-memory", description="Memory lifecycle sync engine v2.2 (Claude Code + Codex)")
+    parser = argparse.ArgumentParser(prog="sync-memory", description="Memory lifecycle sync engine (Claude Code + Codex + ZCode)")
     sub = parser.add_subparsers(dest="command")
 
     sync_p = sub.add_parser("sync", help="Full sync: scan .md, update metadata, rebuild INDEX, update hot list")

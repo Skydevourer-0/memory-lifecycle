@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import common
 
@@ -511,11 +512,28 @@ class TestEnsureMarkers(unittest.TestCase):
 
 
 class TestGetHotListTarget(unittest.TestCase):
-    def test_global_dual_targets(self):
+    def test_global_targets(self):
         targets = common.get_hot_list_target("global")
-        self.assertEqual(len(targets), 2)
+        # Claude + Codex always; ZCode appended only when ~/.zcode exists.
+        expected = 3 if os.path.isdir(os.path.expanduser("~/.zcode")) else 2
+        self.assertEqual(len(targets), expected)
         self.assertTrue(targets[0].endswith("CLAUDE.md"))
         self.assertTrue(targets[1].endswith("AGENTS.md"))
+        if expected == 3:
+            # expanduser may yield mixed separators on Windows; compare loosely.
+            self.assertTrue(targets[2].endswith("AGENTS.md"))
+            self.assertIn(".zcode", targets[2])
+
+    def test_global_targets_zcode_gated(self):
+        """The ZCode target tracks the zcode_installed() gate exactly."""
+        with mock.patch.object(common, "zcode_installed", return_value=False):
+            targets = common.get_hot_list_target("global")
+            self.assertEqual(len(targets), 2)
+        with mock.patch.object(common, "zcode_installed", return_value=True):
+            targets = common.get_hot_list_target("global")
+            self.assertEqual(len(targets), 3)
+            self.assertTrue(targets[2].endswith("AGENTS.md"))
+            self.assertIn(".zcode", targets[2])
 
     def test_project_hotlist(self):
         tmp = tempfile.TemporaryDirectory()

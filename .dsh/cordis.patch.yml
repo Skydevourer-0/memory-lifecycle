@@ -1,0 +1,4 @@
+# dsh bundle patch: register the memory-lifecycle native hook plugin.
+- insert:
+    - id: memory-lifecycle-dsh
+      name: 'memory-lifecycle-dsh'

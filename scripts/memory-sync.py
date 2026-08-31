@@ -429,7 +429,7 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
                 print(f"WARNING: '{fname}' -- invalid slug format, skipped")
                 continue
             if slug not in metadata:
-                metadata[slug] = {"name": slug, "description": "", "read_when": [], "references": []}
+                metadata[slug] = common.default_entry(slug)
                 new_stubs += 1
                 new_slugs.append(slug)
 
@@ -443,13 +443,26 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
     broken = []
     for name, entry in metadata.items():
         for ref in entry.get("references", []):
-            clean = ref.replace("global:", "", 1)
-            if clean not in slug_set and not ref.startswith("global:"):
-                broken.append(f"  {name}: references unknown slug '{ref}'")
+            raw = ref if isinstance(ref, str) else ref.get("to", "")
+            clean = common._ref_target(ref)
+            if clean not in slug_set and not raw.startswith("global:"):
+                broken.append(f"  {name}: references unknown slug '{raw}'")
     if broken:
         print("Broken references (reported, not blocking sync):")
         for b in broken:
             print(b)
+
+    # Auto-link entity edges (mnemon entity graph): extract entities from each
+    # .md body, then link memories sharing entities. Deterministic + idempotent.
+    changed = bool(new_stubs or orphans)
+    for name, entry in metadata.items():
+        if not entry.get("entities"):
+            md_path = os.path.join(mem_dir, f"{name}.md")
+            if os.path.exists(md_path):
+                with open(md_path, "r", encoding="utf-8") as f:
+                    entry["entities"] = common.extract_entities(f.read())
+                changed = True
+        common.auto_link_entity_edges(metadata, name, entry.get("entities", []))
 
     for name, entry in metadata.items():
         dups = common.duplicate_read_when(entry.get("read_when", []))
@@ -468,7 +481,7 @@ def cmd_sync(mem_dir, dry_run=False, scope_from_file=None):
         print("[DRY-RUN] No changes written.")
         return 0
 
-    if new_stubs or orphans:
+    if changed:
         common.write_all_metadata(jsonl_path, metadata)
 
     index_path = get_index_path(mem_dir)
@@ -646,7 +659,11 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
 
     headings = common.extract_headings(body)
     entry = metadata[slug]
+    common.track_access(entry)
+    common.write_metadata(jsonl_path, slug, entry)
     existing_refs = entry.get("references", [])
+    slug_refs = [r for r in existing_refs if isinstance(r, str)]
+    entity_edges = [r for r in existing_refs if isinstance(r, dict)]
     current_slugs = [n for n in metadata if n != slug]
     global_mem_dir = common.get_memory_dir("global")
     global_metadata = {}
@@ -658,14 +675,19 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
         print("  Body headings (candidates for read_when):", file=out)
         for h in headings:
             print(f"    ## {h}", file=out)
-    print(f"  Existing references: {len(existing_refs)}/10  [{', '.join(existing_refs)}]" if existing_refs else f"  Existing references: 0/10", file=out)
+    if slug_refs:
+        print(f"  Existing references: {len(slug_refs)}/10  [{', '.join(slug_refs)}]", file=out)
+    else:
+        print(f"  Existing references: 0/10", file=out)
+    if entity_edges:
+        edge_str = ', '.join(f"{e.get('to', '?')} (via {e.get('entity', '?')})" for e in entity_edges)
+        print(f"  Entity edges (auto):  [{edge_str}]", file=out)
     if current_slugs:
         print(f"  Available slugs (current scope):  [{', '.join(current_slugs)}]", file=out)
     if global_metadata:
         global_names = list(global_metadata.keys())
         print(f"  Available slugs (global, with prefix):  [{', '.join(f'global:{n}' for n in global_names)}]", file=out)
     rw = entry.get("read_when", [])
-    refs = entry.get("references", [])
     desc = entry.get("description", "")
     print("  Status:", file=out)
     if not desc.strip():
@@ -676,8 +698,8 @@ def cmd_hint(mem_dir, slug, hook_mode=False):
         print(f"    read_when    [MISSING]  required, min 1 phrase, max 8", file=out)
     else:
         print(f"    read_when    (review)  {rw[:3]}{'...' if len(rw) > 3 else ''}", file=out)
-    if refs:
-        print(f"    references   (review)  {refs}", file=out)
+    if slug_refs:
+        print(f"    references   (review)  {slug_refs}", file=out)
     else:
         print(f"    references   [empty]  optional, max 10", file=out)
     print(f"  Next:  $SM set-metadata {slug} <<'EOF' ...", file=out)
@@ -733,7 +755,14 @@ def cmd_set_metadata(mem_dir, slug):
     if "read_when" in data:
         entry["read_when"] = data["read_when"]
     if "references" in data:
-        entry["references"] = data["references"]
+        auto = [r for r in entry.get("references", []) if isinstance(r, dict)]
+        entry["references"] = auto + data["references"]
+    if "importance" in data:
+        entry["importance"] = data["importance"]
+    if "entities" in data:
+        entry["entities"] = data["entities"]
+    if "tags" in data:
+        entry["tags"] = data["tags"]
 
     common.write_metadata(jsonl_path, slug, entry)
     print(f"Metadata written for '{slug}'.")
@@ -751,7 +780,7 @@ def cmd_delete(mem_dir, slug, dry_run=False, scope_from_file=None):
     affected = []
     for name, entry in metadata.items():
         refs = entry.get("references", [])
-        if slug in refs or f"global:{slug}" in refs:
+        if any(common._ref_target(r) == slug for r in refs):
             affected.append(name)
 
     if dry_run:
@@ -766,7 +795,7 @@ def cmd_delete(mem_dir, slug, dry_run=False, scope_from_file=None):
 
     for name in affected:
         entry = metadata[name]
-        entry["references"] = [r for r in entry.get("references", []) if r not in (slug, f"global:{slug}")]
+        entry["references"] = [r for r in entry.get("references", []) if common._ref_target(r) != slug]
         common.write_metadata(jsonl_path, name, entry)
 
     common.remove_metadata(jsonl_path, slug)
@@ -817,7 +846,7 @@ def cmd_audit(mem_dir):
     if one_way:
         print(f"\nOne-way edges ({len(one_way)}):")
         for n in one_way:
-            refs = metadata[n].get("references", [])
+            refs = [r if isinstance(r, str) else r.get("to", "") for r in metadata[n].get("references", [])]
             print(f"  [{n}] -> {refs}")
     else:
         print("\nNo one-way edges.")
@@ -849,9 +878,8 @@ def _display_graph(mem_dir, metadata, emit, no_mermaid=False):
     emit()
     for a in nodes:
         for b in metadata[a].get("references", []):
-            # b 已剔除 exclude 与自引用(在 cmd_display 中完成)
-            # global: 前缀边跨 scope,标签原样输出含 global:B;本 scope 边无前缀。
-            emit(f'    {a} --> {b}')
+            target = b if isinstance(b, str) else b.get("to", "")
+            emit(f'    {a} --> {target}')
     emit("```")
 
 
@@ -864,7 +892,7 @@ def _graph_as_table(metadata, in_degree, emit):
     for a in sorted(metadata.keys()):
         out = metadata[a].get("references", [])
         in_cnt = in_degree.get(a, 0)
-        out_str = ", ".join(out) if out else "—"
+        out_str = ", ".join(r if isinstance(r, str) else r.get("to", "") for r in out) if out else "—"
         in_str = f"{in_cnt}" if in_cnt else "— (孤立)" if not out else "—"
         emit(f"| {a} | {out_str} | {in_str} |")
 
@@ -875,19 +903,19 @@ def _display_stats(mem_dir, metadata, emit):
     total = len(metadata)
     with_refs = [e for e in metadata.values() if e.get("references")]
     edges = sum(len(e.get("references", [])) for e in metadata.values())
-    cross = sum(1 for e in metadata.values() for r in e.get("references", []) if r.startswith("global:"))
+    cross = sum(1 for e in metadata.values() for r in e.get("references", []) if isinstance(r, str) and r.startswith("global:"))
     hubs = sorted((n for n, d in in_degree.items() if d >= 3), key=lambda n: n)
     avg = f"{edges / total:.2f}" if total else "0.00"
     isolates = [n for n, e in metadata.items() if in_degree.get(n, 0) == 0 and not e.get("references")]
     # 预计算每个 slug 的引用集合(去除 global: 前缀),避免双向检查时 O(n²) 重建列表
     refs_clean = {
-        n: {r.replace("global:", "", 1) for r in metadata[n].get("references", [])}
+        n: {common._ref_target(r) for r in metadata[n].get("references", [])}
         for n in metadata
     }
     bidir = set()
     for a in metadata:
         for r in metadata[a].get("references", []):
-            clean = r.replace("global:", "", 1)
+            clean = common._ref_target(r)
             if clean in metadata and a in refs_clean.get(clean, set()):
                 bidir.add(tuple(sorted((a, clean))))
     top = sorted(metadata.keys(), key=lambda n: (-scores[n], n))
@@ -914,7 +942,7 @@ def _display_stats(mem_dir, metadata, emit):
     emit(f"| 覆盖技术主题 | {len(topics)} ({topic_str}) — 按 slug 前缀自动分组 |")
 
     emit()
-    emit("### 热榜 Top 5(按引用分数排序)")
+    emit("### 热榜 Top 5(按有效重要度 EI 排序)")
     emit()
     emit("| 排名 | 记忆 | 入度 | 出度 | 分数 |")
     emit("|------|------|------|------|------|")
@@ -923,7 +951,7 @@ def _display_stats(mem_dir, metadata, emit):
         emit(f"| {i} | {n} | {in_degree.get(n, 0)} | {out} | {scores[n]:.1f} |")
     coverage = f"{len(with_refs) / total * 100:.0f}%" if total else "0%"
     emit()
-    emit(f"**覆盖率**:{coverage} 的记忆建立了引用关系,知识网络已形成初步骨架。分数 = 入度×2 + 出度×0.5,引用越多越核心。")
+    emit(f"**覆盖率**:{coverage} 的记忆建立了引用关系。分数 = 有效重要度(EI)= 基础重要度 × 访问频率 × 时间衰减 × 图连接度")
 
 
 def _topic_groups(slugs):
@@ -1178,12 +1206,12 @@ def cmd_display(mem_dir, args):
         for name, entry in metadata.items():
             entry["references"] = [
                 r for r in entry.get("references", [])
-                if r.replace("global:", "", 1) not in exclude_set
+                if common._ref_target(r) not in exclude_set
             ]
 
         # 防御:拒绝自引用(metadata 校验已禁止,但脏数据时跳过)
         for name, entry in metadata.items():
-            entry["references"] = [r for r in entry.get("references", []) if r.replace("global:", "", 1) != name]
+            entry["references"] = [r for r in entry.get("references", []) if common._ref_target(r) != name]
 
         if not metadata:
             # 空库或全部被 exclude 排空 → 空状态占位

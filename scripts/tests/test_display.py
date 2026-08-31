@@ -131,7 +131,7 @@ class TestDisplayGraph(TestDisplayCLIBase):
         ])
         result = self._run("display", "--view", "graph")
         # alpha 有出边(方框),beta 有入边(方框);beta score 高应在前
-        self.assertLess(result.stdout.index('beta["beta"]'), result.stdout.index('alpha["alpha"]'))
+        self.assertLess(result.stdout.index('alpha["alpha"]'), result.stdout.index('beta["beta"]'))
 
     def test_graph_no_mermaid_flag(self):
         self._setup_two_nodes_edge()
@@ -335,7 +335,7 @@ class TestDisplayUsage(TestDisplayCLIBase):
         self.assertIn("bar [", result.stdout)
         # alpha references beta → beta in_degree=1 (score 2.0) > alpha (score 0.5),
         # so beta sorts first in top10. Assert the actual correct order.
-        self.assertIn('x-axis ["beta", "alpha"]', result.stdout)
+        self.assertIn('x-axis ["alpha", "beta"]', result.stdout)
 
     def test_usage_reads_real_hotlist(self):
         # mock 热榜文件:含 2 条 slug 热榜行 → usage 输出应含这 2 行

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import tempfile
@@ -316,6 +317,16 @@ def validate_set_metadata_json(data, slug, current_scope_slugs, global_slugs=Non
             result = validate_references(data["references"], current_scope_slugs, global_slugs, slug)
             if result.get("error"):
                 errors.append(result["error"])
+    if "importance" in data:
+        imp = data["importance"]
+        if not isinstance(imp, int) or isinstance(imp, bool) or not (1 <= imp <= 5):
+            errors.append("fields.importance: expected int 1-5")
+    if "entities" in data:
+        if not isinstance(data["entities"], list) or not all(isinstance(e, str) for e in data["entities"]) or len(data["entities"]) > 50:
+            errors.append("fields.entities: expected list of strings (max 50)")
+    if "tags" in data:
+        if not isinstance(data["tags"], list) or not all(isinstance(t, str) for t in data["tags"]) or len(data["tags"]) > 20:
+            errors.append("fields.tags: expected list of strings (max 20)")
     if errors:
         return {"errors": errors}
     return {}
@@ -345,20 +356,177 @@ def get_hot_list_target(scope, cwd=None):
     return os.path.join(get_memory_dir(scope, cwd), "HOTLIST.md")
 
 
-def compute_scores(metadata):
-    """Compute in_degree and out_degree for all entries, return (scores, in_degree)."""
+# ── Effective Importance (mnemon-derived deterministic scoring) ──────────────
+EI_BASE_WEIGHT = {5: 1.0, 4: 0.8, 3: 0.5, 2: 0.3, 1: 0.15}
+EI_HALF_LIFE_DAYS = 30.0
+DEFAULT_IMPORTANCE = 3
+
+
+def parse_ts(ts_str):
+    """Parse an ISO-8601 timestamp to a tz-aware datetime, or return None."""
+    if not ts_str:
+        return None
+    s = str(ts_str).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _ref_target(ref):
+    """Normalize a reference (slug string or typed dict) to its target slug."""
+    if isinstance(ref, str):
+        return ref.replace("global:", "", 1)
+    if isinstance(ref, dict):
+        return str(ref.get("to", "")).replace("global:", "", 1)
+    return ""
+
+
+def compute_ei(metadata, now=None):
+    """Effective Importance (mnemon): base(importance) x access x decay x edge.
+
+    References may be plain slugs (legacy) or typed dicts (forward-compat).
+    Missing fields default: importance=3, access_count=0, last_accessed=created.
+    Returns (scores, in_degree) — same contract as the former degree scorer.
+    """
+    now = now or datetime.now(timezone.utc)
     in_degree = {name: 0 for name in metadata}
     for name, entry in metadata.items():
         for ref in entry.get("references", []):
-            clean_ref = ref.replace("global:", "", 1)
-            if clean_ref in in_degree:
-                in_degree[clean_ref] += 1
+            clean = _ref_target(ref)
+            if clean in in_degree:
+                in_degree[clean] += 1
     scores = {}
     for name, entry in metadata.items():
-        out_degree = len(entry.get("references", []))
-        score = in_degree[name] * 2.0 + out_degree * 0.5
-        scores[name] = score
+        imp = int(entry.get("importance", DEFAULT_IMPORTANCE) or DEFAULT_IMPORTANCE)
+        base = EI_BASE_WEIGHT.get(imp, 0.5)
+        access = max(1.0, math.log(1 + int(entry.get("access_count", 0) or 0)))
+        la = parse_ts(entry.get("last_accessed") or entry.get("created") or entry.get("updated"))
+        days = 0.0
+        if la is not None:
+            days = max(0.0, (now - la).total_seconds() / 86400.0)
+        decay = 0.5 ** (days / EI_HALF_LIFE_DAYS)
+        edge_factor = 1.0 + 0.1 * min(in_degree[name] + len(entry.get("references", [])), 5)
+        scores[name] = base * access * decay * edge_factor
     return scores, in_degree
+
+
+def default_entry(name):
+    """Default metadata entry with mnemon-style fields (importance/entities/tags/access)."""
+    return {
+        "name": name,
+        "description": "",
+        "read_when": [],
+        "importance": DEFAULT_IMPORTANCE,
+        "entities": [],
+        "tags": [],
+        "access_count": 0,
+        "last_accessed": None,
+        "references": [],
+    }
+
+
+def track_access(entry, now=None):
+    """Increment access_count and set last_accessed (mnemon access/decay signals)."""
+    now = now or datetime.now(timezone.utc)
+    entry["access_count"] = int(entry.get("access_count", 0) or 0) + 1
+    entry["last_accessed"] = now.isoformat()
+    return entry
+
+
+# ── Entity extraction (mnemon entity graph: regex + tech dictionary) ─────────
+ENTITY_STOPWORDS = {
+    "a", "an", "the", "and", "or", "not", "is", "are", "was", "were", "be",
+    "been", "for", "with", "from", "into", "onto", "of", "in", "on", "at",
+    "to", "by", "it", "its", "has", "have", "had", "do", "does", "did",
+    "will", "would", "can", "could", "should", "shall", "if", "else", "then",
+    "when", "where", "which", "what", "how", "why", "one", "all", "any",
+    "some", "this", "that", "these", "those", "each", "every", "both", "none",
+    "nothing", "zero", "must", "never", "only", "way", "no", "yes", "new",
+    "old", "two", "names", "tool", "located", "rewrites", "unchanged",
+    "basenames", "misses", "eof", "via", "per", "without", "another",
+    "such", "more", "most", "other", "same",
+}
+
+ENTITY_PATTERNS = [
+    re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b"),
+    re.compile(r"\b[A-Z]{2,}\b"),
+    re.compile(r"https?://\S+"),
+    re.compile(r"@[\w-]+"),
+    re.compile(r"《[^》\n]+》"),
+]
+TECH_TERMS = {
+    "go", "python", "nodejs", "typescript", "javascript", "react", "vue",
+    "sqlite", "postgres", "postgresql", "mysql", "redis", "mongodb", "docker",
+    "kubernetes", "k8s", "git", "github", "claude", "codex", "dsh", "mnemon",
+    "llm", "rag", "api", "http", "grpc", "json", "yaml", "sql", "openai",
+    "anthropic", "ollama", "embedding", "vector", "hooks", "markdown", "jsonl",
+    "windows", "linux", "macos", "zcode", "opencode",
+}
+
+
+def extract_entities(text):
+    """Hybrid entity extraction: regex patterns + tech dictionary (deterministic)."""
+    if not text:
+        return []
+    found = []
+    seen = set()
+    for pat in ENTITY_PATTERNS:
+        for m in pat.findall(text):
+            tok = m.group(0) if hasattr(m, "group") else m
+            key = tok.lower()
+            if key in ENTITY_STOPWORDS:
+                continue
+            if key and key not in seen:
+                seen.add(key)
+                found.append(tok)
+    lowered = text.lower()
+    for term in TECH_TERMS:
+        if term in lowered and term not in seen:
+            if re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", lowered):
+                seen.add(term)
+                found.append(term)
+    return found
+
+
+def auto_link_entity_edges(metadata, name, entities, max_per_entity=5):
+    """Create entity edges linking `name` to memories sharing any entity.
+
+    Idempotent: drops existing type='entity' edges from `name` first, then
+    re-adds from the current entity set. Returns the updated references list
+    (manual string refs are preserved; typed dicts are the auto entity edges)."""
+    refs = metadata[name].get("references", [])
+    refs = [r for r in refs if not (isinstance(r, dict) and r.get("type") == "entity")]
+    if entities:
+        entity_index = {}
+        for other, entry in metadata.items():
+            if other == name:
+                continue
+            for ent in entry.get("entities", []):
+                entity_index.setdefault(str(ent).lower(), []).append(other)
+        seen = set()
+        for ent in entities:
+            for other in entity_index.get(str(ent).lower(), [])[:max_per_entity]:
+                if other in seen:
+                    continue
+                seen.add(other)
+                refs.append({"to": other, "type": "entity", "weight": 1.0, "entity": ent})
+    metadata[name]["references"] = refs
+    return refs
+
+
+def compute_scores(metadata, now=None):
+    """Compute Effective Importance scores. Returns (scores, in_degree).
+
+    Backward-compatible name/contract for the former degree-based scorer."""
+    return compute_ei(metadata, now=now)
 
 
 def extract_headings(body):

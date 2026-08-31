@@ -50,6 +50,12 @@ always global. No `.git` found → global.
    session by the SessionStart hook (`startup|resume|clear|compact`). No action needed.
 2. **WARM** — Before non-trivial tasks, grep INDEX.md for `read-when` phrases. One file per scope.
 
+Scoring is **Effective Importance (EI)**: `base(importance) x access(recall/hint
+frequency) x decay(30-day half-life) x edge(graph connectivity)`. `importance`
+(default 3) is the only field set by hand; access/decay/edges are tracked/derived
+automatically. Entity edges auto-link on sync when two memories share a technical
+entity (regex + dictionary extraction).
+
 Known limits (Codex): if `~/.codex/AGENTS.override.md` exists it takes precedence over
 `AGENTS.md` and the hot list is not loaded; AGENTS.md merging is capped at 32 KiB
 (the hot list is ~1200 chars, appended at the end — impact negligible). After Codex
@@ -109,7 +115,10 @@ $SM set-metadata <slug> <<'EOF'
 {
   "description": "...",
   "read_when": ["...", "..."],
-  "references": ["other-slug", "global:cross-scope-slug"]
+  "references": ["other-slug", "global:cross-scope-slug"],
+  "importance": 3,
+  "entities": ["react", "sqlite"],
+  "tags": ["frontend", "storage"]
 }
 EOF
 ```
@@ -123,6 +132,9 @@ Duplicate `read_when` phrases warn but do not block.
 | `description` | >= 20 non-whitespace chars. NOT in blacklist (TBD, TODO, placeholder, WIP, draft, 待补充, 记住, 记一下, 重要, 备忘, 笔记, 总结, 概述, 相关信息). NOT boilerplate (EN/中文模板). | 2 |
 | `read_when` | 1–8 phrases. Each: >= 2 words OR >= 10 chars. No stopword-only. No blacklisted. | 2 |
 | `references` | Max 10. No self-ref. Every target must exist. `global:` prefix for cross-scope. Duplicates silently deduped. | 1 |
+| `importance` | Int 1-5 (default 3). EI base weight: 5->1.0, 4->0.8, 3->0.5, 2->0.3, 1->0.15. | 2 |
+| `entities` | List of strings (max 50). Auto-extracted on sync; set manually to override. Feeds entity-graph auto-link. | 2 |
+| `tags` | List of strings (max 20). Free-form. | 2 |
 
 ## Remove
 

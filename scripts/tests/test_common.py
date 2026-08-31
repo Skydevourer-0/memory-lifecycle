@@ -368,22 +368,75 @@ class TestScoring(unittest.TestCase):
             "b": {"name": "b", "description": "d", "read_when": ["y"], "references": ["c"]},
             "c": {"name": "c", "description": "d", "read_when": ["z"], "references": []},
         }
-        scores, _ = common.compute_scores(metadata)
-        # a: in=0 out=2 -> 0*2.0 + 2*0.5 = 1.0
-        # b: in=1 out=1 -> 1*2.0 + 1*0.5 = 2.5
-        # c: in=2 out=0 -> 2*2.0 + 0*0.5 = 4.0
-        self.assertAlmostEqual(scores["a"], 1.0)
-        self.assertAlmostEqual(scores["b"], 2.5)
-        self.assertAlmostEqual(scores["c"], 4.0)
+        scores, in_degree = common.compute_scores(metadata)
+        # EI = base(imp3=0.5) x access(0)=1.0 x decay(no ts)=1.0 x edge(1+0.1*deg)
+        # a: in=0 out=2 deg=2 -> 0.6 ; b: in=1 out=1 deg=2 -> 0.6 ; c: in=2 out=0 deg=2 -> 0.6
+        self.assertAlmostEqual(scores["a"], 0.6)
+        self.assertAlmostEqual(scores["b"], 0.6)
+        self.assertAlmostEqual(scores["c"], 0.6)
+        self.assertEqual(in_degree, {"a": 0, "b": 1, "c": 2})
 
-    def test_score_all_zero_tiebreaker(self):
+    def test_score_isolated_gets_base(self):
         metadata = {
             "z": {"name": "z", "description": "d", "read_when": [], "references": []},
             "a": {"name": "a", "description": "d", "read_when": [], "references": []},
         }
         scores, _ = common.compute_scores(metadata)
-        self.assertEqual(scores["a"], 0.0)
-        self.assertEqual(scores["z"], 0.0)
+        # isolated memories get the base importance score (imp3=0.5), not zero
+        self.assertEqual(scores["a"], 0.5)
+        self.assertEqual(scores["z"], 0.5)
+
+    def test_ei_importance_factor(self):
+        metadata = {
+            "hi": {"name": "hi", "description": "d", "read_when": [], "references": [], "importance": 5},
+            "lo": {"name": "lo", "description": "d", "read_when": [], "references": [], "importance": 1},
+        }
+        scores, _ = common.compute_scores(metadata)
+        self.assertAlmostEqual(scores["hi"], 1.0)   # imp5 -> base 1.0
+        self.assertAlmostEqual(scores["lo"], 0.15)  # imp1 -> base 0.15
+
+    def test_ei_access_and_decay(self):
+        metadata = {
+            "used": {"name": "used", "description": "d", "read_when": [], "references": [],
+                     "access_count": 10, "last_accessed": "2026-01-01T00:00:00+00:00"},
+            "fresh": {"name": "fresh", "description": "d", "read_when": [], "references": [],
+                      "access_count": 0, "last_accessed": None},
+        }
+        now = common.datetime(2026, 1, 2, tzinfo=common.timezone.utc)  # 1 day later
+        scores, _ = common.compute_scores(metadata, now=now)
+        # used: base 0.5 x log(11)=2.398 x decay(1d)=0.977 > fresh: 0.5
+        self.assertGreater(scores["used"], scores["fresh"])
+
+    def test_extract_entities(self):
+        entities = common.extract_entities("We use React and SQLite with a https://example.com URL and HttpServer")
+        lowered = [e.lower() for e in entities]
+        self.assertIn("react", lowered)
+        self.assertIn("sqlite", lowered)
+        self.assertIn("httpserver", lowered)
+        self.assertIn("https://example.com", lowered)
+
+    def test_track_access(self):
+        entry = common.default_entry("x")
+        common.track_access(entry)
+        self.assertEqual(entry["access_count"], 1)
+        self.assertIsNotNone(entry["last_accessed"])
+        common.track_access(entry)
+        self.assertEqual(entry["access_count"], 2)
+
+    def test_auto_link_entity_edges(self):
+        metadata = {
+            "a": {"name": "a", "description": "d", "read_when": [], "references": [], "entities": ["react", "sqlite"]},
+            "b": {"name": "b", "description": "d", "read_when": [], "references": [], "entities": ["react"]},
+            "c": {"name": "c", "description": "d", "read_when": [], "references": [], "entities": ["docker"]},
+        }
+        common.auto_link_entity_edges(metadata, "a", ["react", "sqlite"])
+        refs = metadata["a"]["references"]
+        targets = [r["to"] if isinstance(r, dict) else r for r in refs]
+        self.assertIn("b", targets)       # shares 'react'
+        self.assertNotIn("c", targets)    # no shared entity
+        common.auto_link_entity_edges(metadata, "a", ["react", "sqlite"])
+        targets2 = [r["to"] if isinstance(r, dict) else r for r in metadata["a"]["references"]]
+        self.assertEqual(targets, targets2)  # idempotent
 
 
 class TestHeadingExtraction(unittest.TestCase):
